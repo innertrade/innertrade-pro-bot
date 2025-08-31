@@ -40,6 +40,22 @@ def init_db(conn):
             CREATE UNIQUE INDEX IF NOT EXISTS ix_chat_context_chat_user
               ON chat_context (chat_id, user_id);
         """)
+        # pins могут быть ещё не созданы — тихо пытаемся
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS pins (
+              id SERIAL PRIMARY KEY,
+              user_id BIGINT NOT NULL,
+              chat_id BIGINT NOT NULL,
+              project TEXT NOT NULL,
+              doc_version_id INT NOT NULL,
+              note TEXT,
+              created_at TIMESTAMP DEFAULT now()
+            );
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS ix_pins_chat_user_proj
+              ON pins (chat_id, user_id, project);
+        """)
 
 def get_conn():
     if not hasattr(app, "_db_conn") or app._db_conn.closed:
@@ -93,7 +109,7 @@ def health():
 # --- Webhook ------------------------------------------------------------------
 @app.post(WEBHOOK_PATH)
 def webhook():
-    chat_id = None  # чтобы except не падал на NameError
+    chat_id = None
     try:
         upd = request.get_json(force=True, silent=True) or {}
         msg = upd.get("message") or upd.get("edited_message") or {}
@@ -117,7 +133,11 @@ def webhook():
                 "Команды:\n"
                 "/help — справка\n"
                 "/use <Project> — выбрать активный проект (например, /use Innertrade)\n"
-                "/find <запрос> — найти документы в активном проекте"
+                "/find <запрос> — найти документы\n"
+                "/pin <id> [note] — закрепить версию документа\n"
+                "/pins — список закреплённого\n"
+                "/unpin <id> — снять закреп\n"
+                "/show <id> — показать начало контента"
             )
             return {"ok": True}
 
@@ -125,9 +145,12 @@ def webhook():
         if cmd == "/help":
             send_message(chat_id,
                 "Справка:\n"
-                "/use <Project> — активировать проект для этого чата\n"
-                "/find <запрос> — поиск по названию и содержимому актуальных версий\n"
-                "Скоро: /pin и ответы по контексту (RAG)."
+                "/use <Project>\n"
+                "/find <запрос>\n"
+                "/pin <id> [note]\n"
+                "/pins\n"
+                "/unpin <id>\n"
+                "/show <id>"
             )
             return {"ok": True}
 
@@ -184,6 +207,135 @@ def webhook():
             if len(reply) > 3800:
                 reply = reply[:3800] + "…"
             send_message(chat_id, reply)
+            return {"ok": True}
+
+        # /pin <id> [note]
+        if cmd == "/pin":
+            if not arg:
+                send_message(chat_id, "Формат: /pin <doc_version_id> [note]")
+                return {"ok": True}
+            parts2 = arg.split(maxsplit=1)
+            try:
+                ver_id = int(parts2[0])
+            except ValueError:
+                send_message(chat_id, "id должен быть числом (см. /find)")
+                return {"ok": True}
+            note = parts2[1].strip() if len(parts2) > 1 else None
+
+            conn = get_conn()
+            project = get_active_project(conn, chat_id, user_id)
+            if not project:
+                send_message(chat_id, "Сначала выбери проект: /use Innertrade")
+                return {"ok": True}
+
+            # проверим, что версия существует и принадлежит проекту
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT d.title, dv.version
+                    FROM doc_versions dv
+                    JOIN docs d ON d.id = dv.doc_id
+                    WHERE dv.id = %s AND d.project = %s
+                    LIMIT 1;
+                """, (ver_id, project))
+                row = cur.fetchone()
+            if not row:
+                send_message(chat_id, "Версия не найдена в активном проекте.")
+                return {"ok": True}
+
+            title, version = row
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO pins (user_id, chat_id, project, doc_version_id, note)
+                    VALUES (%s, %s, %s, %s, %s);
+                """, (user_id, chat_id, project, ver_id, note))
+            send_message(chat_id, f"Закрепил: {title} • {version} (id:{ver_id})")
+            return {"ok": True}
+
+        # /pins
+        if cmd == "/pins":
+            conn = get_conn()
+            project = get_active_project(conn, chat_id, user_id)
+            if not project:
+                send_message(chat_id, "Сначала выбери проект: /use Innertrade")
+                return {"ok": True}
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT p.id, p.doc_version_id, d.title, dv.version, COALESCE(p.note,'')
+                    FROM pins p
+                    JOIN doc_versions dv ON dv.id = p.doc_version_id
+                    JOIN docs d ON d.id = dv.doc_id
+                    WHERE p.chat_id=%s AND p.user_id=%s AND p.project=%s
+                    ORDER BY p.created_at DESC
+                    LIMIT 10;
+                """, (chat_id, user_id, project))
+                rows = cur.fetchall()
+            if not rows:
+                send_message(chat_id, "Пока ничего не закреплено. Используй /pin <id> из результатов /find.")
+                return {"ok": True}
+            lines = []
+            for i, (pid, ver_id, title, version, note) in enumerate(rows, 1):
+                extra = f" — {note}" if note else ""
+                lines.append(f"{i}) {title} • {version} (id:{ver_id}){extra}")
+            send_message(chat_id, "Закреплено:\n" + "\n".join(lines))
+            return {"ok": True}
+
+        # /unpin <id>
+        if cmd == "/unpin":
+            if not arg:
+                send_message(chat_id, "Формат: /unpin <doc_version_id>")
+                return {"ok": True}
+            try:
+                ver_id = int(arg)
+            except ValueError:
+                send_message(chat_id, "id должен быть числом.")
+                return {"ok": True}
+            conn = get_conn()
+            project = get_active_project(conn, chat_id, user_id)
+            if not project:
+                send_message(chat_id, "Сначала выбери проект: /use Innertrade")
+                return {"ok": True}
+            with conn.cursor() as cur:
+                cur.execute("""
+                    DELETE FROM pins
+                    WHERE chat_id=%s AND user_id=%s AND project=%s AND doc_version_id=%s;
+                """, (chat_id, user_id, project, ver_id))
+                deleted = cur.rowcount
+            if deleted:
+                send_message(chat_id, "Снял закреп.")
+            else:
+                send_message(chat_id, "Такой закреп не найден.")
+            return {"ok": True}
+
+        # /show <id> — первые 800 символов
+        if cmd == "/show":
+            if not arg:
+                send_message(chat_id, "Формат: /show <doc_version_id>")
+                return {"ok": True}
+            try:
+                ver_id = int(arg)
+            except ValueError:
+                send_message(chat_id, "id должен быть числом.")
+                return {"ok": True}
+            conn = get_conn()
+            project = get_active_project(conn, chat_id, user_id)
+            if not project:
+                send_message(chat_id, "Сначала выбери проект: /use Innertrade")
+                return {"ok": True}
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT d.title, dv.version, dv.content_md
+                    FROM doc_versions dv
+                    JOIN docs d ON d.id = dv.doc_id
+                    WHERE dv.id=%s AND d.project=%s
+                    LIMIT 1;
+                """, (ver_id, project))
+                row = cur.fetchone()
+            if not row:
+                send_message(chat_id, "Версия не найдена в активном проекте.")
+                return {"ok": True}
+            title, version, content = row
+            snippet = (content or "")[:800]
+            send_message(chat_id, f"{title} • {version}\n\n{snippet}")
             return {"ok": True}
 
         # нераспознанная команда/текст
