@@ -12,7 +12,6 @@ DATABASE_URL   = os.environ["DATABASE_URL"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 WEBHOOK_PATH   = f"/webhook/{TELEGRAM_TOKEN}"
 
-# Модель и системный промпт для Ассистента
 LLM_MODEL = "gpt-4o-mini"
 ASSISTANT_SYSTEM = """Ты — Ассистент с внешней памятью (RAG).
 Отвечай кратко, по делу, опираясь ТОЛЬКО на предоставленный контекст.
@@ -51,7 +50,6 @@ def init_db(conn):
             CREATE UNIQUE INDEX IF NOT EXISTS ix_chat_context_chat_user
               ON chat_context (chat_id, user_id);
         """)
-        # pins (на случай если ещё нет)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS pins (
               id SERIAL PRIMARY KEY,
@@ -117,25 +115,30 @@ def fetch_pinned_context(conn, chat_id, user_id, project, limit=4):
         """, (chat_id, user_id, project, limit))
         return cur.fetchall()  # [(ver_id, title, version, content_md), ...]
 
-def fetch_search_context(conn, project, query, exclude_ids=(), limit=4):
-    ex = tuple(exclude_ids) if exclude_ids else tuple([-1])
+def fetch_search_context(conn, project, query, exclude_ids=None, limit=4):
+    exclude_ids = list(exclude_ids or [])
+    params = [project]
+    sql = """
+        SELECT doc_version_id, title, version, content_md
+        FROM vw_latest_versions
+        WHERE project = %s
+    """
+    if exclude_ids:
+        placeholders = ",".join(["%s"] * len(exclude_ids))
+        sql += f" AND doc_version_id NOT IN ({placeholders})"
+        params.extend(exclude_ids)
+    sql += """
+          AND (title ILIKE '%%' || %s || '%%'
+           OR  content_md ILIKE '%%' || %s || '%%')
+        ORDER BY created_at DESC
+        LIMIT %s;
+    """
+    params.extend([query, query, limit])
     with conn.cursor() as cur:
-        cur.execute(f"""
-            SELECT doc_version_id, title, version, content_md
-            FROM vw_latest_versions
-            WHERE project=%s
-              AND doc_version_id NOT IN %s
-              AND (title ILIKE '%%'||%s||'%%' OR content_md ILIKE '%%'||%s||'%%')
-            ORDER BY created_at DESC
-            LIMIT %s;
-        """, (project, ex, query, query, limit))
+        cur.execute(sql, params)
         return cur.fetchall()
 
 def build_context_blocks(rows, max_chars=1800):
-    """
-    Формирует компактные блоки контента для промпта.
-    max_chars — на блок (чтобы общий контекст не раздувался).
-    """
     blocks = []
     for (ver_id, title, version, content) in rows:
         snippet = (content or "")[:max_chars]
@@ -206,7 +209,7 @@ def webhook():
                 "/pins — список закреплённого\n"
                 "/unpin <id> — снять закреп\n"
                 "/show <id> — показать начало контента\n"
-                "/ask <вопрос> — ответ по памяти (пины → поиск)"
+                "/ask <вопрос> — ответ по памяти (сначала пины, потом поиск)"
             )
             return {"ok": True}
 
@@ -261,11 +264,9 @@ def webhook():
                     LIMIT 5;
                 """, (project, query, query))
                 rows = cur.fetchall()
-
             if not rows:
                 send_message(chat_id, "Ничего не нашёл. Попробуй другие слова.")
                 return {"ok": True}
-
             lines = []
             for i, (title, doc_type, version, ver_id, preview) in enumerate(rows, 1):
                 preview = (preview or "").replace("\n", " ")
@@ -276,7 +277,7 @@ def webhook():
             send_message(chat_id, reply)
             return {"ok": True}
 
-        # /pin
+        # /pin <id> [note]
         if cmd == "/pin":
             if not arg:
                 send_message(chat_id, "Формат: /pin <doc_version_id> [note]")
@@ -288,7 +289,6 @@ def webhook():
                 send_message(chat_id, "id должен быть числом (см. /find)")
                 return {"ok": True}
             note = parts2[1].strip() if len(parts2) > 1 else None
-
             conn = get_conn()
             project = get_active_project(conn, chat_id, user_id)
             if not project:
@@ -306,7 +306,6 @@ def webhook():
             if not row:
                 send_message(chat_id, "Версия не найдена в активном проекте.")
                 return {"ok": True}
-
             title, version = row
             with conn.cursor() as cur:
                 cur.execute("""
@@ -344,7 +343,7 @@ def webhook():
             send_message(chat_id, "Закреплено:\n" + "\n".join(lines))
             return {"ok": True}
 
-        # /unpin
+        # /unpin <id>
         if cmd == "/unpin":
             if not arg:
                 send_message(chat_id, "Формат: /unpin <doc_version_id>")
@@ -368,7 +367,7 @@ def webhook():
             send_message(chat_id, "Снял закреп." if deleted else "Такой закреп не найден.")
             return {"ok": True}
 
-        # /show
+        # /show <id>
         if cmd == "/show":
             if not arg:
                 send_message(chat_id, "Формат: /show <doc_version_id>")
@@ -402,34 +401,34 @@ def webhook():
 
         # /ask <question> — RAG ответ
         if cmd == "/ask":
-            if not arg:
-                send_message(chat_id, "Формат: /ask твой вопрос")
+            if not arg or len(arg.strip()) < 2:
+                send_message(chat_id, "Сформулируй вопрос чуть конкретнее 🙏")
                 return {"ok": True}
-            question = arg
+            question = arg.strip()
             conn = get_conn()
             project = get_active_project(conn, chat_id, user_id)
             if not project:
                 send_message(chat_id, "Сначала выбери проект: /use Innertrade")
                 return {"ok": True}
-
             pinned = fetch_pinned_context(conn, chat_id, user_id, project, limit=4)
             pinned_ids = [r[0] for r in pinned]
-            # небольшой эвристический поиск по вопросам
             search = fetch_search_context(conn, project, question, exclude_ids=pinned_ids, limit=4)
-
             blocks = build_context_blocks(pinned) + build_context_blocks(search)
             answer = rag_answer(question, blocks)
             send_message(chat_id, answer)
             return {"ok": True}
 
-        # Любой некомандный текст — тоже трактуем как вопрос к Ассистенту
+        # Любой некомандный текст — трактуем как вопрос к Ассистенту (RAG)
         if not text_raw.startswith("/"):
+            question = text_raw.strip()
+            if len(question) < 2:
+                send_message(chat_id, "Сформулируй вопрос чуть конкретнее 🙏")
+                return {"ok": True}
             conn = get_conn()
             project = get_active_project(conn, chat_id, user_id)
             if not project:
                 send_message(chat_id, "Сначала выбери проект: /use Innertrade")
                 return {"ok": True}
-            question = text_raw
             pinned = fetch_pinned_context(conn, chat_id, user_id, project, limit=4)
             pinned_ids = [r[0] for r in pinned]
             search = fetch_search_context(conn, project, question, exclude_ids=pinned_ids, limit=4)
