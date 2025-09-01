@@ -1,4 +1,5 @@
 import os
+import math
 import urllib.request
 import urllib.parse
 from flask import Flask, request
@@ -14,13 +15,14 @@ DEFAULT_PROJECT  = os.environ.get("DEFAULT_PROJECT", "").strip()  # опцион
 WEBHOOK_PATH     = f"/webhook/{TELEGRAM_TOKEN}"
 
 LLM_MODEL = "gpt-4o-mini"
+EMB_MODEL = "text-embedding-3-small"  # 1536-мерный
 ASSISTANT_SYSTEM = """Ты — Ассистент с внешней памятью (RAG).
 Отвечай кратко, по делу, опираясь ТОЛЬКО на предоставленный контекст.
 Если в контексте нет ответа — прямо скажи, чего не хватает, и предложи уточнить запрос или добавить материалы.
 НЕЛЬЗЯ давать финансовые/медицинские рекомендации; это не инвестиционный совет.
 Язык ответа: русский."""
 
-# --- Flask app ----------------------------------------------------------------
+# --- Flask & OpenAI -----------------------------------------------------------
 app = Flask(__name__)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -38,19 +40,9 @@ def _new_conn():
 
 def init_db(conn):
     with conn.cursor() as cur:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS chat_context (
-              id SERIAL PRIMARY KEY,
-              chat_id BIGINT NOT NULL,
-              user_id BIGINT NOT NULL,
-              project TEXT NOT NULL,
-              created_at TIMESTAMP DEFAULT now()
-            );
-        """)
-        cur.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS ix_chat_context_chat_user
-              ON chat_context (chat_id, user_id);
-        """)
+        # базовые таблицы
+        cur.execute("CREATE TABLE IF NOT EXISTS chat_context (id SERIAL PRIMARY KEY, chat_id BIGINT NOT NULL, user_id BIGINT NOT NULL, project TEXT NOT NULL, created_at TIMESTAMP DEFAULT now());")
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ix_chat_context_chat_user ON chat_context (chat_id, user_id);")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS pins (
               id SERIAL PRIMARY KEY,
@@ -62,10 +54,29 @@ def init_db(conn):
               created_at TIMESTAMP DEFAULT now()
             );
         """)
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_pins_chat_user_proj ON pins (chat_id, user_id, project);")
+
+        # pgvector + таблица чанков
+        cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+        # эмбеддинг 1536 — под EMB_MODEL
         cur.execute("""
-            CREATE INDEX IF NOT EXISTS ix_pins_chat_user_proj
-              ON pins (chat_id, user_id, project);
+            CREATE TABLE IF NOT EXISTS doc_chunks (
+              id BIGSERIAL PRIMARY KEY,
+              doc_version_id INT NOT NULL,
+              chunk_no INT NOT NULL,
+              content TEXT NOT NULL,
+              embedding VECTOR(1536),
+              created_at TIMESTAMP DEFAULT now(),
+              UNIQUE (doc_version_id, chunk_no)
+            );
         """)
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_doc_chunks_docver ON doc_chunks (doc_version_id);")
+        # индекс HNSW для быстрых векторных запросов
+        try:
+            cur.execute("CREATE INDEX IF NOT EXISTS ix_doc_chunks_embedding_hnsw ON doc_chunks USING hnsw (embedding vector_l2_ops);")
+        except Exception:
+            # если HNSW недоступен в плане, переживём без него
+            pass
 
 def get_conn():
     if not hasattr(app, "_db_conn") or app._db_conn.closed:
@@ -84,18 +95,11 @@ def get_conn():
 
 def get_active_project(conn, chat_id, user_id):
     with conn.cursor() as cur:
-        cur.execute("""
-            SELECT project
-            FROM chat_context
-            WHERE chat_id=%s AND user_id=%s
-            ORDER BY id DESC
-            LIMIT 1;
-        """, (chat_id, user_id))
+        cur.execute("SELECT project FROM chat_context WHERE chat_id=%s AND user_id=%s ORDER BY id DESC LIMIT 1;", (chat_id, user_id))
         row = cur.fetchone()
     return row[0] if row else None
 
 def resolve_project(conn, chat_id, user_id):
-    """Возвращает активный проект; если нет — подставляет DEFAULT_PROJECT (если задан) и возвращает его."""
     proj = get_active_project(conn, chat_id, user_id)
     if proj:
         return proj
@@ -131,6 +135,38 @@ def send_message(chat_id: int, text: str):
     with urllib.request.urlopen(req, timeout=10) as r:
         r.read()
 
+# --- Text chunking & embeddings ----------------------------------------------
+def chunk_text(text: str, max_len: int = 900, overlap: int = 120):
+    text = (text or "").strip()
+    if not text:
+        return []
+    chunks = []
+    i = 0
+    n = len(text)
+    while i < n:
+        j = min(i + max_len, n)
+        chunk = text[i:j]
+        # стараемся резать по границе абзаца/предложения
+        cut = max(chunk.rfind("\n\n"), chunk.rfind(". "), chunk.rfind("! "), chunk.rfind("? "))
+        if cut > max_len * 0.5:
+            chunk = chunk[:cut+1]
+            j = i + len(chunk)
+        chunks.append(chunk.strip())
+        if j >= n:
+            break
+        i = max(0, j - overlap)
+    return [c for c in chunks if c]
+
+def embed_texts(texts: list[str]) -> list[list[float]]:
+    if not texts:
+        return []
+    resp = client.embeddings.create(model=EMB_MODEL, input=texts)
+    return [item.embedding for item in resp.data]
+
+def vector_to_sql_literal(vec: list[float]) -> str:
+    # pgvector формат: [x1, x2, ...]
+    return "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
+
 # --- RAG helpers --------------------------------------------------------------
 def fetch_pinned_context(conn, chat_id, user_id, project, limit=4):
     with conn.cursor() as cur:
@@ -145,7 +181,38 @@ def fetch_pinned_context(conn, chat_id, user_id, project, limit=4):
         """, (chat_id, user_id, project, limit))
         return cur.fetchall()
 
-def fetch_search_context(conn, project, query, exclude_ids=None, limit=4):
+def semantic_search_topk(conn, project: str, query: str, k: int = 6):
+    # эмбеддинг запроса
+    q_emb = embed_texts([query])[0]
+    q_vec = vector_to_sql_literal(q_emb)
+
+    # берём лучшие чанки по расстоянию, аггрегируем до doc_version_id
+    sql = f"""
+        WITH top AS (
+          SELECT ch.doc_version_id,
+                 MIN(ch.embedding <=> { '%s' }::vector) AS dist
+          FROM doc_chunks ch
+          JOIN doc_versions dv ON dv.id = ch.doc_version_id
+          JOIN docs d ON d.id = dv.doc_id
+          WHERE d.project = %s
+          GROUP BY ch.doc_version_id
+          ORDER BY dist ASC
+          LIMIT %s
+        )
+        SELECT dv.id AS doc_version_id, d.title, dv.version, dv.content_md, top.dist
+        FROM top
+        JOIN doc_versions dv ON dv.id = top.doc_version_id
+        JOIN docs d ON d.id = dv.doc_id
+        ORDER BY top.dist ASC;
+    """
+    with conn.cursor() as cur:
+        # первый параметр — вектор запроса, второй — проект, третий — лимит
+        cur.execute(sql, (q_vec, project, k))
+        rows = cur.fetchall()
+    # rows: (doc_version_id, title, version, content_md, dist)
+    return [(r[0], r[1], r[2], r[3]) for r in rows]
+
+def fallback_ilike_search(conn, project, query, exclude_ids=None, limit=4):
     exclude_ids = list(exclude_ids or [])
     params = [project]
     sql = """
@@ -185,10 +252,7 @@ def rag_answer(question: str, blocks: list[str]) -> str:
     resp = client.chat.completions.create(
         model=LLM_MODEL,
         temperature=0.3,
-        messages=[
-            {"role":"system","content":ASSISTANT_SYSTEM},
-            {"role":"user","content":user_prompt}
-        ],
+        messages=[{"role":"system","content":ASSISTANT_SYSTEM},{"role":"user","content":user_prompt}],
         max_tokens=500,
     )
     return resp.choices[0].message.content.strip()
@@ -204,29 +268,24 @@ def summarize_doc(title: str, version: str, content: str, bullets: int = 5) -> s
     resp = client.chat.completions.create(
         model=LLM_MODEL,
         temperature=0.2,
-        messages=[
-            {"role":"system","content":ASSISTANT_SYSTEM},
-            {"role":"user","content":prompt}
-        ],
+        messages=[{"role":"system","content":ASSISTANT_SYSTEM},{"role":"user","content":prompt}],
         max_tokens=500,
     )
     return resp.choices[0].message.content.strip()
 
-# --- Context preview ----------------------------------------------------------
 def context_preview(conn, chat_id, user_id, project, question, limit=3):
     pinned = fetch_pinned_context(conn, chat_id, user_id, project, limit=limit)
     pinned_ids = [r[0] for r in pinned]
-    search = fetch_search_context(conn, project, question, exclude_ids=pinned_ids, limit=limit)
-
+    sem = semantic_search_topk(conn, project, question or " ", k=limit) if question else []
+    sem_ids = [r[0] for r in sem]
+    fb = fallback_ilike_search(conn, project, question or " ", exclude_ids=pinned_ids+sem_ids, limit=limit) if question else []
     def fmt(rows, label):
-        if not rows:
-            return f"{label}: —"
+        if not rows: return f"{label}: —"
         lines = []
         for (ver_id, title, version, _content) in rows:
             lines.append(f"[id:{ver_id}] {title} • {version}")
         return f"{label}:\n" + "\n".join(lines)
-
-    return fmt(pinned, "Пины") + "\n\n" + fmt(search, "Поиск")
+    return fmt(pinned, "Пины") + "\n\n" + fmt(sem, "Семантика") + "\n\n" + fmt(fb, "Fallback")
 
 # --- Health -------------------------------------------------------------------
 @app.get("/health")
@@ -278,7 +337,8 @@ def webhook():
                 "/context [вопрос] — показать, какие фрагменты пойдут в ответ\n"
                 "/reset [pins|project|all] — сброс закрепов/проекта\n"
                 "/summ <id> [n] — краткое резюме документа\n"
-                "/ask <вопрос> — ответ по памяти (сначала пины, потом поиск)"
+                "/index <id> — проиндексировать документ для семантического поиска\n"
+                "/ask <вопрос> — ответ по памяти (пины → семантика → fallback)"
             )
             return {"ok": True}
 
@@ -286,14 +346,11 @@ def webhook():
         if cmd == "/help":
             send_message(chat_id,
                 "Подсказка:\n"
-                "/use <Project>\n"
-                "/projects — список проектов\n"
-                "/find <запрос>\n"
-                "/pin <id> [note], /pins, /unpin <id>, /show <id>\n"
-                "/context [вопрос] — показать источники\n"
-                "/reset [pins|project|all]\n"
-                "/summ <id> [n] — краткое резюме документа\n"
-                "/ask <вопрос> — ответ на основе закреплённого и найденного контента."
+                "/use <Project>, /projects\n"
+                "/find <запрос>, /pin <id> [note], /pins, /unpin <id>, /show <id>\n"
+                "/context [вопрос], /reset [pins|project|all]\n"
+                "/summ <id> [n], /index <id>\n"
+                "/ask <вопрос> — ответ по памяти (пины → семантика → fallback)"
             )
             return {"ok": True}
 
@@ -443,10 +500,7 @@ def webhook():
                 send_message(chat_id, "Сначала выбери проект: /use <Project> (или задай DEFAULT_PROJECT в ENV).")
                 return {"ok": True}
             with conn.cursor() as cur:
-                cur.execute("""
-                    DELETE FROM pins
-                    WHERE chat_id=%s AND user_id=%s AND project=%s AND doc_version_id=%s;
-                """, (chat_id, user_id, project, ver_id))
+                cur.execute("DELETE FROM pins WHERE chat_id=%s AND user_id=%s AND project=%s AND doc_version_id=%s;", (chat_id, user_id, project, ver_id))
                 deleted = cur.rowcount
             send_message(chat_id, "Снял закреп." if deleted else "Такой закреп не найден.")
             return {"ok": True}
@@ -499,52 +553,30 @@ def webhook():
         if cmd == "/reset":
             mode = (arg or "").strip().lower()
             conn = get_conn()
-
             if mode == "all":
                 with conn.cursor() as cur:
-                    cur.execute("""
-                        DELETE FROM pins
-                        WHERE chat_id=%s AND user_id=%s;
-                    """, (chat_id, user_id))
-                    cur.execute("""
-                        DELETE FROM chat_context
-                        WHERE chat_id=%s AND user_id=%s;
-                    """, (chat_id, user_id))
+                    cur.execute("DELETE FROM pins WHERE chat_id=%s AND user_id=%s;", (chat_id, user_id))
+                    cur.execute("DELETE FROM chat_context WHERE chat_id=%s AND user_id=%s;", (chat_id, user_id))
                 send_message(chat_id, "Полный сброс: пины очищены, проект сброшен.")
                 return {"ok": True}
-
             project = get_active_project(conn, chat_id, user_id)
-
             if mode == "pins":
                 if not project:
                     send_message(chat_id, "Нет активного проекта. Сначала /use <Project> или /reset project.")
                     return {"ok": True}
                 with conn.cursor() as cur:
-                    cur.execute("""
-                        DELETE FROM pins
-                        WHERE chat_id=%s AND user_id=%s AND project=%s;
-                    """, (chat_id, user_id, project))
+                    cur.execute("DELETE FROM pins WHERE chat_id=%s AND user_id=%s AND project=%s;", (chat_id, user_id, project))
                 send_message(chat_id, "Все закрепы по текущему проекту сняты.")
                 return {"ok": True}
-
             if mode == "project":
                 with conn.cursor() as cur:
-                    cur.execute("""
-                        DELETE FROM chat_context
-                        WHERE chat_id=%s AND user_id=%s;
-                    """, (chat_id, user_id))
+                    cur.execute("DELETE FROM chat_context WHERE chat_id=%s AND user_id=%s;", (chat_id, user_id))
                 send_message(chat_id, "Активный проект сброшен. Укажи заново: /use <Project>")
                 return {"ok": True}
-
-            send_message(chat_id,
-                "Формат: /reset [pins|project|all]\n"
-                "• /reset pins — снять все закрепы в текущем проекте\n"
-                "• /reset project — сбросить активный проект\n"
-                "• /reset all — очистить все пины и сбросить проект(ы)"
-            )
+            send_message(chat_id, "Формат: /reset [pins|project|all]\n• /reset pins — снять все закрепы в текущем проекте\n• /reset project — сбросить активный проект\n• /reset all — очистить все пины и сбросить проект(ы)")
             return {"ok": True}
 
-        # /summ <doc_version_id> [n] — краткое резюме документа
+        # /summ <doc_version_id> [n]
         if cmd == "/summ":
             if not arg:
                 send_message(chat_id, "Формат: /summ <doc_version_id> [кол-во_пунктов]\nНапр.: /summ 1 7")
@@ -561,13 +593,11 @@ def webhook():
                     bullets = int(parts2[1])
                 except ValueError:
                     bullets = 5
-
             conn = get_conn()
             project = resolve_project(conn, chat_id, user_id)
             if not project:
                 send_message(chat_id, "Сначала выбери проект: /use <Project> (или задай DEFAULT_PROJECT в ENV).")
                 return {"ok": True}
-
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT d.title, dv.version, dv.content_md
@@ -580,14 +610,66 @@ def webhook():
             if not row:
                 send_message(chat_id, "Версия не найдена в активном проекте.")
                 return {"ok": True}
-
             title, version, content = row
             summary = summarize_doc(title, version, content or "", bullets)
             summary = f"{title} • {version}\n\n{summary}\n\nИсточник: [id:{ver_id}] {title} • {version}"
             send_message(chat_id, summary)
             return {"ok": True}
 
-        # /ask <question> — RAG ответ с источниками
+        # /index <doc_version_id> — построить эмбеддинги для документа
+        if cmd == "/index":
+            if not arg:
+                send_message(chat_id, "Формат: /index <doc_version_id>\nИндексация создаёт чанки и эмбеддинги для семантического поиска.")
+                return {"ok": True}
+            try:
+                ver_id = int(arg)
+            except ValueError:
+                send_message(chat_id, "id должен быть числом (см. /find).")
+                return {"ok": True}
+            conn = get_conn()
+            project = resolve_project(conn, chat_id, user_id)
+            if not project:
+                send_message(chat_id, "Сначала выбери проект: /use <Project> (или задай DEFAULT_PROJECT в ENV).")
+                return {"ok": True}
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT d.title, dv.version, dv.content_md
+                    FROM doc_versions dv
+                    JOIN docs d ON d.id = dv.doc_id
+                    WHERE dv.id=%s AND d.project=%s
+                    LIMIT 1;
+                """, (ver_id, project))
+                row = cur.fetchone()
+            if not row:
+                send_message(chat_id, "Версия не найдена в активном проекте.")
+                return {"ok": True}
+            title, version, content = row
+            chunks = chunk_text(content or "", max_len=900, overlap=120)
+            if not chunks:
+                send_message(chat_id, "Пустой документ: нечего индексировать.")
+                return {"ok": True}
+            # удалим старый индекс этой версии
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM doc_chunks WHERE doc_version_id=%s;", (ver_id,))
+            # эмбеддинги пачками по 64
+            batch = 64
+            total = len(chunks)
+            inserted = 0
+            for start in range(0, total, batch):
+                part = chunks[start:start+batch]
+                embs = embed_texts(part)
+                with conn.cursor() as cur:
+                    for i, (chunk, emb) in enumerate(zip(part, embs), start=start):
+                        vec_str = vector_to_sql_literal(emb)
+                        cur.execute(
+                            "INSERT INTO doc_chunks (doc_version_id, chunk_no, content, embedding) VALUES (%s,%s,%s,%s::vector);",
+                            (ver_id, i, chunk, vec_str)
+                        )
+                        inserted += 1
+            send_message(chat_id, f"Проиндексировано: {inserted} чанков для {title} • {version} (id:{ver_id}).")
+            return {"ok": True}
+
+        # /ask <question> — RAG ответ (пины → семантика → fallback) + источники
         if cmd == "/ask":
             if not arg or len(arg.strip()) < 2:
                 send_message(chat_id, "Сформулируй вопрос чуть конкретнее 🙏")
@@ -598,25 +680,21 @@ def webhook():
             if not project:
                 send_message(chat_id, "Сначала выбери проект: /use <Project> (или задай DEFAULT_PROJECT в ENV).")
                 return {"ok": True}
-
             pinned = fetch_pinned_context(conn, chat_id, user_id, project, limit=4)
             pinned_ids = [r[0] for r in pinned]
-            search = fetch_search_context(conn, project, question, exclude_ids=pinned_ids, limit=4)
-
-            blocks = build_context_blocks(pinned) + build_context_blocks(search)
+            sem = semantic_search_topk(conn, project, question, k=6)
+            sem_ids = [r[0] for r in sem]
+            fb = fallback_ilike_search(conn, project, question, exclude_ids=pinned_ids+sem_ids, limit=4)
+            rows = pinned + sem + fb
+            blocks = build_context_blocks(rows)
             answer = rag_answer(question, blocks)
-
-            src_rows = pinned + search
-            if src_rows:
-                src_lines = []
-                for (ver_id, title, version, _content) in src_rows[:6]:
-                    src_lines.append(f"- [id:{ver_id}] {title} • {version}")
-                answer = f"{answer}\n\nИсточники:\n" + "\n".join(src_lines)
-
+            if rows:
+                src_lines = [f"- [id:{vid}] {t} • {ver}" for (vid, t, ver, _c) in rows[:8]]
+                answer += "\n\nИсточники:\n" + "\n".join(src_lines)
             send_message(chat_id, answer)
             return {"ok": True}
 
-        # Любой некомандный текст — трактуем как вопрос к Ассистенту (RAG) + источники
+        # Любой некомандный текст — трактуем как вопрос (тот же RAG) + источники
         if not text_raw.startswith("/"):
             question = text_raw.strip()
             if len(question) < 2:
@@ -627,21 +705,17 @@ def webhook():
             if not project:
                 send_message(chat_id, "Сначала выбери проект: /use <Project> (или задай DEFAULT_PROJECT в ENV).")
                 return {"ok": True}
-
             pinned = fetch_pinned_context(conn, chat_id, user_id, project, limit=4)
             pinned_ids = [r[0] for r in pinned]
-            search = fetch_search_context(conn, project, question, exclude_ids=pinned_ids, limit=4)
-
-            blocks = build_context_blocks(pinned) + build_context_blocks(search)
+            sem = semantic_search_topk(conn, project, question, k=6)
+            sem_ids = [r[0] for r in sem]
+            fb = fallback_ilike_search(conn, project, question, exclude_ids=pinned_ids+sem_ids, limit=4)
+            rows = pinned + sem + fb
+            blocks = build_context_blocks(rows)
             answer = rag_answer(question, blocks)
-
-            src_rows = pinned + search
-            if src_rows:
-                src_lines = []
-                for (ver_id, title, version, _content) in src_rows[:6]:
-                    src_lines.append(f"- [id:{ver_id}] {title} • {version}")
-                answer = f"{answer}\n\nИсточники:\n" + "\n".join(src_lines)
-
+            if rows:
+                src_lines = [f"- [id:{vid}] {t} • {ver}" for (vid, t, ver, _c) in rows[:8]]
+                answer += "\n\nИсточники:\n" + "\n".join(src_lines)
             send_message(chat_id, answer)
             return {"ok": True}
 
