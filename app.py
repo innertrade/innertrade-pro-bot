@@ -163,6 +163,22 @@ def rag_answer(question: str, blocks: list[str]) -> str:
     )
     return resp.choices[0].message.content.strip()
 
+# --- Context preview ----------------------------------------------------------
+def context_preview(conn, chat_id, user_id, project, question, limit=3):
+    pinned = fetch_pinned_context(conn, chat_id, user_id, project, limit=limit)
+    pinned_ids = [r[0] for r in pinned]
+    search = fetch_search_context(conn, project, question, exclude_ids=pinned_ids, limit=limit)
+
+    def fmt(rows, label):
+        if not rows:
+            return f"{label}: —"
+        lines = []
+        for (ver_id, title, version, _content) in rows:
+            lines.append(f"[id:{ver_id}] {title} • {version}")
+        return f"{label}:\n" + "\n".join(lines)
+
+    return fmt(pinned, "Пины") + "\n\n" + fmt(search, "Поиск")
+
 # --- Health -------------------------------------------------------------------
 @app.get("/health")
 def health():
@@ -209,6 +225,8 @@ def webhook():
                 "/pins — список закреплённого\n"
                 "/unpin <id> — снять закреп\n"
                 "/show <id> — показать начало контента\n"
+                "/context [вопрос] — показать, какие фрагменты пойдут в ответ\n"
+                "/reset [pins|project|all] — сброс закрепов/проекта\n"
                 "/ask <вопрос> — ответ по памяти (сначала пины, потом поиск)"
             )
             return {"ok": True}
@@ -220,7 +238,9 @@ def webhook():
                 "/use <Project>\n"
                 "/find <запрос>\n"
                 "/pin <id> [note], /pins, /unpin <id>, /show <id>\n"
-                "/ask <вопрос> — ответ на основе закреплённого и найденного контента."
+                "/context [вопрос] — показать источники\n"
+                "/reset [pins|project|all]\n"
+                "/ask <вопрос> — ответ по закреплённому и найденному контенту."
             )
             return {"ok": True}
 
@@ -397,6 +417,54 @@ def webhook():
             title, version, content = row
             snippet = (content or "")[:800]
             send_message(chat_id, f"{title} • {version}\n\n{snippet}")
+            return {"ok": True}
+
+        # /context [вопрос]
+        if cmd == "/context":
+            conn = get_conn()
+            project = get_active_project(conn, chat_id, user_id)
+            if not project:
+                send_message(chat_id, "Сначала выбери проект: /use Innertrade")
+                return {"ok": True}
+            question = arg or " "
+            preview = context_preview(conn, chat_id, user_id, project, question, limit=3)
+            send_message(chat_id, "Контекст для ответа:\n" + preview)
+            return {"ok": True}
+
+        # /reset [pins|project|all]
+        if cmd == "/reset":
+            mode = (arg or "").strip().lower()
+            conn = get_conn()
+            project = get_active_project(conn, chat_id, user_id)
+
+            if mode in ("pins", "all"):
+                if not project:
+                    send_message(chat_id, "Нет активного проекта. Сначала /use <Project> или /reset project.")
+                    return {"ok": True}
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        DELETE FROM pins
+                        WHERE chat_id=%s AND user_id=%s AND project=%s;
+                    """, (chat_id, user_id, project))
+                if mode == "pins":
+                    send_message(chat_id, "Все закрепы по текущему проекту сняты.")
+                    return {"ok": True}
+
+            if mode in ("project", "all"):
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        DELETE FROM chat_context
+                        WHERE chat_id=%s AND user_id=%s;
+                    """, (chat_id, user_id))
+                send_message(chat_id, "Активный проект сброшен. Укажи заново: /use <Project>")
+                return {"ok": True}
+
+            send_message(chat_id,
+                "Формат: /reset [pins|project|all]\n"
+                "• /reset pins — снять все закрепы в текущем проекте\n"
+                "• /reset project — сбросить активный проект\n"
+                "• /reset all — и проект, и закрепы"
+            )
             return {"ok": True}
 
         # /ask <question> — RAG ответ
