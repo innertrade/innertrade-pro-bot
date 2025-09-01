@@ -7,10 +7,11 @@ from psycopg import OperationalError
 from openai import OpenAI
 
 # --- ENV / Const --------------------------------------------------------------
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-DATABASE_URL   = os.environ["DATABASE_URL"]
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-WEBHOOK_PATH   = f"/webhook/{TELEGRAM_TOKEN}"
+TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
+DATABASE_URL     = os.environ["DATABASE_URL"]
+OPENAI_API_KEY   = os.environ["OPENAI_API_KEY"]
+DEFAULT_PROJECT  = os.environ.get("DEFAULT_PROJECT", "").strip()  # опционально
+WEBHOOK_PATH     = f"/webhook/{TELEGRAM_TOKEN}"
 
 LLM_MODEL = "gpt-4o-mini"
 ASSISTANT_SYSTEM = """Ты — Ассистент с внешней памятью (RAG).
@@ -92,6 +93,37 @@ def get_active_project(conn, chat_id, user_id):
         """, (chat_id, user_id))
         row = cur.fetchone()
     return row[0] if row else None
+
+def resolve_project(conn, chat_id, user_id):
+    """Возвращает активный проект; если нет — подставляет DEFAULT_PROJECT (если задан) и возвращает его."""
+    proj = get_active_project(conn, chat_id, user_id)
+    if proj:
+        return proj
+    if DEFAULT_PROJECT:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO chat_context (chat_id, user_id, project)
+                VALUES (%s,%s,%s)
+                ON CONFLICT (chat_id, user_id)
+                DO UPDATE SET project = EXCLUDED.project, created_at = now();
+            """, (chat_id, user_id, DEFAULT_PROJECT))
+        return DEFAULT_PROJECT
+    return None
+
+def list_projects(conn):
+    with conn.cursor() as cur:
+        # сначала пытаемся взять из docs (если она есть и наполнена)
+        try:
+            cur.execute("SELECT DISTINCT project FROM docs ORDER BY project;")
+            rows = cur.fetchall()
+            if rows:
+                return [r[0] for r in rows]
+        except Exception:
+            pass
+        # fallback — что когда-либо встречалось в chat_context
+        cur.execute("SELECT DISTINCT project FROM chat_context ORDER BY project;")
+        rows = cur.fetchall()
+    return [r[0] for r in rows]
 
 # --- Telegram helper ----------------------------------------------------------
 def send_message(chat_id: int, text: str):
@@ -220,6 +252,7 @@ def webhook():
                 "Команды:\n"
                 "/help — подсказка\n"
                 "/use <Project> — выбрать проект (например, /use Innertrade)\n"
+                "/projects — показать список известных проектов\n"
                 "/find <запрос> — поиск по документам\n"
                 "/pin <id> [note] — закрепить версию\n"
                 "/pins — список закреплённого\n"
@@ -236,12 +269,24 @@ def webhook():
             send_message(chat_id,
                 "Подсказка:\n"
                 "/use <Project>\n"
+                "/projects — список проектов\n"
                 "/find <запрос>\n"
                 "/pin <id> [note], /pins, /unpin <id>, /show <id>\n"
                 "/context [вопрос] — показать источники\n"
                 "/reset [pins|project|all]\n"
-                "/ask <вопрос> — ответ по закреплённому и найденному контенту."
+                "/ask <вопрос> — ответ на основе закреплённого и найденного контента."
             )
+            return {"ok": True}
+
+        # /projects
+        if cmd == "/projects":
+            conn = get_conn()
+            projs = list_projects(conn)
+            if not projs:
+                send_message(chat_id, "Проектов пока не найдено. Укажи проект через /use <Project> или загрузите документы.")
+                return {"ok": True}
+            lines = "\n".join(f"• {p}" for p in projs[:50])
+            send_message(chat_id, "Доступные проекты:\n" + lines + "\n\nВыбери: /use <Project>")
             return {"ok": True}
 
         # /use <Project>
@@ -268,9 +313,9 @@ def webhook():
                 return {"ok": True}
             query = arg
             conn = get_conn()
-            project = get_active_project(conn, chat_id, user_id)
+            project = resolve_project(conn, chat_id, user_id)
             if not project:
-                send_message(chat_id, "Сначала выбери проект: /use Innertrade")
+                send_message(chat_id, "Сначала выбери проект: /use <Project> (или задай DEFAULT_PROJECT в ENV).")
                 return {"ok": True}
             with conn.cursor() as cur:
                 cur.execute("""
@@ -310,9 +355,9 @@ def webhook():
                 return {"ok": True}
             note = parts2[1].strip() if len(parts2) > 1 else None
             conn = get_conn()
-            project = get_active_project(conn, chat_id, user_id)
+            project = resolve_project(conn, chat_id, user_id)
             if not project:
-                send_message(chat_id, "Сначала выбери проект: /use Innertrade")
+                send_message(chat_id, "Сначала выбери проект: /use <Project> (или задай DEFAULT_PROJECT в ENV).")
                 return {"ok": True}
             with conn.cursor() as cur:
                 cur.execute("""
@@ -338,9 +383,9 @@ def webhook():
         # /pins
         if cmd == "/pins":
             conn = get_conn()
-            project = get_active_project(conn, chat_id, user_id)
+            project = resolve_project(conn, chat_id, user_id)
             if not project:
-                send_message(chat_id, "Сначала выбери проект: /use Innertrade")
+                send_message(chat_id, "Сначала выбери проект: /use <Project> (или задай DEFAULT_PROJECT в ENV).")
                 return {"ok": True}
             with conn.cursor() as cur:
                 cur.execute("""
@@ -374,9 +419,9 @@ def webhook():
                 send_message(chat_id, "id должен быть числом.")
                 return {"ok": True}
             conn = get_conn()
-            project = get_active_project(conn, chat_id, user_id)
+            project = resolve_project(conn, chat_id, user_id)
             if not project:
-                send_message(chat_id, "Сначала выбери проект: /use Innertrade")
+                send_message(chat_id, "Сначала выбери проект: /use <Project> (или задай DEFAULT_PROJECT в ENV).")
                 return {"ok": True}
             with conn.cursor() as cur:
                 cur.execute("""
@@ -398,9 +443,9 @@ def webhook():
                 send_message(chat_id, "id должен быть числом.")
                 return {"ok": True}
             conn = get_conn()
-            project = get_active_project(conn, chat_id, user_id)
+            project = resolve_project(conn, chat_id, user_id)
             if not project:
-                send_message(chat_id, "Сначала выбери проект: /use Innertrade")
+                send_message(chat_id, "Сначала выбери проект: /use <Project> (или задай DEFAULT_PROJECT в ENV).")
                 return {"ok": True}
             with conn.cursor() as cur:
                 cur.execute("""
@@ -422,9 +467,9 @@ def webhook():
         # /context [вопрос]
         if cmd == "/context":
             conn = get_conn()
-            project = get_active_project(conn, chat_id, user_id)
+            project = resolve_project(conn, chat_id, user_id)
             if not project:
-                send_message(chat_id, "Сначала выбери проект: /use Innertrade")
+                send_message(chat_id, "Сначала выбери проект: /use <Project> (или задай DEFAULT_PROJECT в ENV).")
                 return {"ok": True}
             question = arg or " "
             preview = context_preview(conn, chat_id, user_id, project, question, limit=3)
@@ -435,7 +480,7 @@ def webhook():
         if cmd == "/reset":
             mode = (arg or "").strip().lower()
             conn = get_conn()
-            project = get_active_project(conn, chat_id, user_id)
+            project = get_active_project(conn, chat_id, user_id)  # тут без автоподстановки
 
             if mode in ("pins", "all"):
                 if not project:
@@ -474,9 +519,9 @@ def webhook():
                 return {"ok": True}
             question = arg.strip()
             conn = get_conn()
-            project = get_active_project(conn, chat_id, user_id)
+            project = resolve_project(conn, chat_id, user_id)
             if not project:
-                send_message(chat_id, "Сначала выбери проект: /use Innertrade")
+                send_message(chat_id, "Сначала выбери проект: /use <Project> (или задай DEFAULT_PROJECT в ENV).")
                 return {"ok": True}
             pinned = fetch_pinned_context(conn, chat_id, user_id, project, limit=4)
             pinned_ids = [r[0] for r in pinned]
@@ -493,9 +538,9 @@ def webhook():
                 send_message(chat_id, "Сформулируй вопрос чуть конкретнее 🙏")
                 return {"ok": True}
             conn = get_conn()
-            project = get_active_project(conn, chat_id, user_id)
+            project = resolve_project(conn, chat_id, user_id)
             if not project:
-                send_message(chat_id, "Сначала выбери проект: /use Innertrade")
+                send_message(chat_id, "Сначала выбери проект: /use <Project> (или задай DEFAULT_PROJECT в ENV).")
                 return {"ok": True}
             pinned = fetch_pinned_context(conn, chat_id, user_id, project, limit=4)
             pinned_ids = [r[0] for r in pinned]
