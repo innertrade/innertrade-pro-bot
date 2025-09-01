@@ -1,5 +1,6 @@
 import os
-import math
+import time
+import json
 import urllib.request
 import urllib.parse
 from flask import Flask, request
@@ -10,12 +11,12 @@ from openai import OpenAI
 # --- ENV / Const --------------------------------------------------------------
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 DATABASE_URL     = os.environ["DATABASE_URL"]
-OPENAI_API_KEY   = os.environ["OPENAI_API_KEY"]
+OPENAI_API_KEY   = os.environ.get("OPENAI_API_KEY", "")
 DEFAULT_PROJECT  = os.environ.get("DEFAULT_PROJECT", "").strip()  # опционально
 WEBHOOK_PATH     = f"/webhook/{TELEGRAM_TOKEN}"
 
 LLM_MODEL = "gpt-4o-mini"
-EMB_MODEL = "text-embedding-3-small"  # 1536-мерный
+EMB_MODEL = "text-embedding-3-small"  # 1536 dims
 ASSISTANT_SYSTEM = """Ты — Ассистент с внешней памятью (RAG).
 Отвечай кратко, по делу, опираясь ТОЛЬКО на предоставленный контекст.
 Если в контексте нет ответа — прямо скажи, чего не хватает, и предложи уточнить запрос или добавить материалы.
@@ -24,9 +25,20 @@ ASSISTANT_SYSTEM = """Ты — Ассистент с внешней память
 
 # --- Flask & OpenAI -----------------------------------------------------------
 app = Flask(__name__)
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-# --- DB helpers (psycopg v3, автопереподключение + keepalive) -----------------
+# простая «аварийная сигнализация»: если словили 429 — 10 минут работаем без LLM
+LLM_COOLDOWN_SEC = 600
+_last_llm_fail_ts = 0.0
+
+def llm_mark_fail():
+    global _last_llm_fail_ts
+    _last_llm_fail_ts = time.time()
+
+def llm_allowed():
+    return client is not None and ((time.time() - _last_llm_fail_ts) > LLM_COOLDOWN_SEC)
+
+# --- DB helpers ---------------------------------------------------------------
 def _new_conn():
     return psycopg.connect(
         DATABASE_URL,
@@ -40,7 +52,7 @@ def _new_conn():
 
 def init_db(conn):
     with conn.cursor() as cur:
-        # базовые таблицы
+        # служебные таблицы
         cur.execute("CREATE TABLE IF NOT EXISTS chat_context (id SERIAL PRIMARY KEY, chat_id BIGINT NOT NULL, user_id BIGINT NOT NULL, project TEXT NOT NULL, created_at TIMESTAMP DEFAULT now());")
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ix_chat_context_chat_user ON chat_context (chat_id, user_id);")
         cur.execute("""
@@ -55,14 +67,33 @@ def init_db(conn):
             );
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS ix_pins_chat_user_proj ON pins (chat_id, user_id, project);")
-
-        # pgvector + таблица чанков
+        # контентные таблицы (минимальная схема)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS docs (
+              id SERIAL PRIMARY KEY,
+              project TEXT NOT NULL,
+              type TEXT NOT NULL,
+              title TEXT NOT NULL,
+              created_at TIMESTAMP DEFAULT now()
+            );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_docs_proj ON docs (project);")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS doc_versions (
+              id SERIAL PRIMARY KEY,
+              doc_id INT NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
+              version TEXT NOT NULL,
+              content_md TEXT NOT NULL,
+              created_at TIMESTAMP DEFAULT now()
+            );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_doc_versions_doc ON doc_versions (doc_id);")
+        # pgvector индекс для семантики (не обязателен для текущей задачи)
         cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-        # эмбеддинг 1536 — под EMB_MODEL
         cur.execute("""
             CREATE TABLE IF NOT EXISTS doc_chunks (
               id BIGSERIAL PRIMARY KEY,
-              doc_version_id INT NOT NULL,
+              doc_version_id INT NOT NULL REFERENCES doc_versions(id) ON DELETE CASCADE,
               chunk_no INT NOT NULL,
               content TEXT NOT NULL,
               embedding VECTOR(1536),
@@ -71,11 +102,29 @@ def init_db(conn):
             );
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS ix_doc_chunks_docver ON doc_chunks (doc_version_id);")
-        # индекс HNSW для быстрых векторных запросов
         try:
             cur.execute("CREATE INDEX IF NOT EXISTS ix_doc_chunks_embedding_hnsw ON doc_chunks USING hnsw (embedding vector_l2_ops);")
         except Exception:
-            # если HNSW недоступен в плане, переживём без него
+            pass
+        # materialized view-стайл: создадим представление latest-версий, если его нет
+        # Примечание: CREATE VIEW IF NOT EXISTS доступен в PG15+, в Neon обычно ок.
+        try:
+            cur.execute("""
+                CREATE VIEW IF NOT EXISTS vw_latest_versions AS
+                SELECT DISTINCT ON (d.id)
+                    d.project,
+                    d.type,
+                    d.title,
+                    dv.id AS doc_version_id,
+                    dv.version,
+                    dv.content_md,
+                    dv.created_at
+                FROM docs d
+                JOIN doc_versions dv ON dv.doc_id = d.id
+                ORDER BY d.id, dv.created_at DESC;
+            """)
+        except Exception:
+            # если уже существует с другим определением — пропустим, код ниже умеет без вьюхи
             pass
 
 def get_conn():
@@ -116,18 +165,15 @@ def resolve_project(conn, chat_id, user_id):
 
 def list_projects(conn):
     with conn.cursor() as cur:
-        try:
-            cur.execute("SELECT DISTINCT project FROM docs ORDER BY project;")
-            rows = cur.fetchall()
-            if rows:
-                return [r[0] for r in rows]
-        except Exception:
-            pass
+        cur.execute("SELECT DISTINCT project FROM docs ORDER BY project;")
+        rows = cur.fetchall()
+        if rows:
+            return [r[0] for r in rows]
         cur.execute("SELECT DISTINCT project FROM chat_context ORDER BY project;")
         rows = cur.fetchall()
     return [r[0] for r in rows]
 
-# --- Telegram helper ----------------------------------------------------------
+# --- Telegram helpers ---------------------------------------------------------
 def send_message(chat_id: int, text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
@@ -135,7 +181,53 @@ def send_message(chat_id: int, text: str):
     with urllib.request.urlopen(req, timeout=10) as r:
         r.read()
 
-# --- Text chunking & embeddings ----------------------------------------------
+def send_long_message(chat_id: int, text: str, chunk_size: int = 3800):
+    text = text or ""
+    i = 0
+    n = len(text)
+    if n == 0:
+        send_message(chat_id, "(пусто)")
+        return
+    while i < n:
+        send_message(chat_id, text[i:i+chunk_size])
+        i += chunk_size
+
+def telegram_get_file_text(file_id: str) -> str:
+    meta_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile?file_id={file_id}"
+    with urllib.request.urlopen(meta_url, timeout=10) as r:
+        meta = json.loads(r.read().decode("utf-8"))
+    file_path = meta["result"]["file_path"]
+    file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
+    with urllib.request.urlopen(file_url, timeout=30) as r:
+        data = r.read()
+    for enc in ("utf-8", "utf-16", "latin-1"):
+        try:
+            return data.decode(enc)
+        except Exception:
+            continue
+    return data.decode("utf-8", "ignore")
+
+def get_text_from_reply(msg: dict):
+    """Берём текст из сообщения-ответа: либо text/caption, либо скачиваем .md/.txt документ."""
+    reply = msg.get("reply_to_message")
+    if not reply:
+        return None, "Эта команда должна быть ответом на сообщение с текстом или на .md/.txt файл."
+    txt = (reply.get("text") or reply.get("caption") or "").strip()
+    if txt:
+        return txt, None
+    doc = reply.get("document")
+    if doc:
+        fname = (doc.get("file_name") or "").lower()
+        if not (fname.endswith(".md") or fname.endswith(".txt") or fname.endswith(".markdown")):
+            return None, "Поддерживаются только файлы .md / .txt"
+        try:
+            text = telegram_get_file_text(doc.get("file_id"))
+            return text, None
+        except Exception as e:
+            return None, f"Не удалось скачать файл: {e}"
+    return None, "В ответе нет текста или поддерживаемого файла."
+
+# --- Text chunking & embeddings (необязательное, работает только при наличии ключа) ---
 def chunk_text(text: str, max_len: int = 900, overlap: int = 120):
     text = (text or "").strip()
     if not text:
@@ -146,11 +238,9 @@ def chunk_text(text: str, max_len: int = 900, overlap: int = 120):
     while i < n:
         j = min(i + max_len, n)
         chunk = text[i:j]
-        # стараемся резать по границе абзаца/предложения
         cut = max(chunk.rfind("\n\n"), chunk.rfind(". "), chunk.rfind("! "), chunk.rfind("? "))
         if cut > max_len * 0.5:
-            chunk = chunk[:cut+1]
-            j = i + len(chunk)
+            chunk = chunk[:cut+1]; j = i + len(chunk)
         chunks.append(chunk.strip())
         if j >= n:
             break
@@ -160,11 +250,17 @@ def chunk_text(text: str, max_len: int = 900, overlap: int = 120):
 def embed_texts(texts: list[str]) -> list[list[float]]:
     if not texts:
         return []
-    resp = client.embeddings.create(model=EMB_MODEL, input=texts)
-    return [item.embedding for item in resp.data]
+    if not llm_allowed():
+        raise RuntimeError("LLM cooldown or no API key")
+    try:
+        resp = client.embeddings.create(model=EMB_MODEL, input=texts)
+        return [item.embedding for item in resp.data]
+    except Exception as e:
+        if "insufficient_quota" in str(e) or "429" in str(e):
+            llm_mark_fail()
+        raise
 
 def vector_to_sql_literal(vec: list[float]) -> str:
-    # pgvector формат: [x1, x2, ...]
     return "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
 
 # --- RAG helpers --------------------------------------------------------------
@@ -182,35 +278,31 @@ def fetch_pinned_context(conn, chat_id, user_id, project, limit=4):
         return cur.fetchall()
 
 def semantic_search_topk(conn, project: str, query: str, k: int = 6):
-    # эмбеддинг запроса
-    q_emb = embed_texts([query])[0]
+    try:
+        q_emb = embed_texts([query])[0]
+    except Exception:
+        return []
     q_vec = vector_to_sql_literal(q_emb)
-
-    # берём лучшие чанки по расстоянию, аггрегируем до doc_version_id
-    sql = f"""
+    sql = """
         WITH top AS (
-          SELECT ch.doc_version_id,
-                 MIN(ch.embedding <=> { '%s' }::vector) AS dist
+          SELECT ch.doc_version_id, MIN(ch.embedding <=> %s::vector) AS dist
           FROM doc_chunks ch
           JOIN doc_versions dv ON dv.id = ch.doc_version_id
           JOIN docs d ON d.id = dv.doc_id
-          WHERE d.project = %s
+          WHERE d.project = %s AND ch.embedding IS NOT NULL
           GROUP BY ch.doc_version_id
           ORDER BY dist ASC
           LIMIT %s
         )
-        SELECT dv.id AS doc_version_id, d.title, dv.version, dv.content_md, top.dist
+        SELECT dv.id, d.title, dv.version, dv.content_md
         FROM top
         JOIN doc_versions dv ON dv.id = top.doc_version_id
         JOIN docs d ON d.id = dv.doc_id
         ORDER BY top.dist ASC;
     """
     with conn.cursor() as cur:
-        # первый параметр — вектор запроса, второй — проект, третий — лимит
         cur.execute(sql, (q_vec, project, k))
-        rows = cur.fetchall()
-    # rows: (doc_version_id, title, version, content_md, dist)
-    return [(r[0], r[1], r[2], r[3]) for r in rows]
+        return cur.fetchall()
 
 def fallback_ilike_search(conn, project, query, exclude_ids=None, limit=4):
     exclude_ids = list(exclude_ids or [])
@@ -232,8 +324,30 @@ def fallback_ilike_search(conn, project, query, exclude_ids=None, limit=4):
     """
     params.extend([query, query, limit])
     with conn.cursor() as cur:
-        cur.execute(sql, params)
-        return cur.fetchall()
+        try:
+            cur.execute(sql, params)
+            return cur.fetchall()
+        except Exception:
+            # если вьюхи нет — берём последний dv для каждого doc вручную
+            cur.execute("""
+                WITH latest AS (
+                  SELECT dv.*
+                  FROM doc_versions dv
+                  JOIN (
+                    SELECT doc_id, MAX(created_at) AS mx
+                    FROM doc_versions GROUP BY doc_id
+                  ) x ON x.doc_id = dv.doc_id AND x.mx = dv.created_at
+                  JOIN docs d ON d.id = dv.doc_id
+                  WHERE d.project = %s
+                )
+                SELECT l.id AS doc_version_id, d.title, l.version, l.content_md
+                FROM latest l
+                JOIN docs d ON d.id = l.doc_id
+                WHERE (d.title ILIKE '%%' || %s || '%%' OR l.content_md ILIKE '%%' || %s || '%%')
+                ORDER BY l.created_at DESC
+                LIMIT %s;
+            """, (project, query, query, limit))
+            return cur.fetchall()
 
 def build_context_blocks(rows, max_chars=1800):
     blocks = []
@@ -242,43 +356,69 @@ def build_context_blocks(rows, max_chars=1800):
         blocks.append(f"[id:{ver_id}] {title} • {version}\n{snippet}")
     return blocks
 
-def rag_answer(question: str, blocks: list[str]) -> str:
-    ctx = "\n\n---\n\n".join(blocks) if blocks else "НЕТ КОНТЕКСТА."
-    user_prompt = (
-        f"Вопрос пользователя: {question}\n\n"
-        f"Контекст (фрагменты документов):\n{ctx}\n\n"
-        "Сформируй краткий ответ по контексту. Если ответа нет в контексте — скажи, что не хватает данных."
-    )
-    resp = client.chat.completions.create(
-        model=LLM_MODEL,
-        temperature=0.3,
-        messages=[{"role":"system","content":ASSISTANT_SYSTEM},{"role":"user","content":user_prompt}],
-        max_tokens=500,
-    )
-    return resp.choices[0].message.content.strip()
+def llm_answer_or_fallback(question: str, blocks: list[str]) -> str:
+    if not blocks:
+        return "По контексту ничего не нашлось. Добавь материалов или уточни запрос."
+    ctx = "\n\n---\n\n".join(blocks)
+    if llm_allowed():
+        try:
+            resp = client.chat.completions.create(
+                model=LLM_MODEL,
+                temperature=0.3,
+                messages=[
+                    {"role":"system","content":ASSISTANT_SYSTEM},
+                    {"role":"user","content":(
+                        f"Вопрос пользователя: {question}\n\n"
+                        f"Контекст (фрагменты документов):\n{ctx}\n\n"
+                        "Сформируй краткий ответ по контексту. Если ответа нет — перечисли, чего не хватает."
+                    )}
+                ],
+                max_tokens=500,
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            if "insufficient_quota" in str(e) or "429" in str(e):
+                llm_mark_fail()
+    # fallback: просто выдержки
+    head = []
+    for b in blocks[:3]:
+        lines = b.splitlines()
+        head.append("\n".join(lines[:6]))
+    return "⚠️ Модель недоступна. Ниже релевантные выдержки:\n\n" + "\n\n---\n\n".join(head)
 
 def summarize_doc(title: str, version: str, content: str, bullets: int = 5) -> str:
     bullets = max(3, min(12, bullets))
-    prompt = (
-        f"Сделай краткое резюме документа в виде {bullets} пунктов.\n"
-        f"Заголовок: {title} • {version}\n\n"
-        f"Текст:\n{content[:8000]}\n\n"
-        "Требования: кратко, по делу, без воды; не выдумывай факты за пределами текста."
-    )
-    resp = client.chat.completions.create(
-        model=LLM_MODEL,
-        temperature=0.2,
-        messages=[{"role":"system","content":ASSISTANT_SYSTEM},{"role":"user","content":prompt}],
-        max_tokens=500,
-    )
-    return resp.choices[0].message.content.strip()
+    if llm_allowed():
+        try:
+            prompt = (
+                f"Сделай краткое резюме документа в виде {bullets} пунктов.\n"
+                f"Заголовок: {title} • {version}\n\nТекст:\n{content[:8000]}\n\n"
+                "Требования: кратко, по делу, без воды; не выдумывай факты."
+            )
+            resp = client.chat.completions.create(
+                model=LLM_MODEL,
+                temperature=0.2,
+                messages=[{"role":"system","content":ASSISTANT_SYSTEM},{"role":"user","content":prompt}],
+                max_tokens=500,
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            if "insufficient_quota" in str(e) or "429" in str(e):
+                llm_mark_fail()
+    # fallback без LLM
+    text = (content or "").strip()
+    paras = [p.strip() for p in text.split("\n\n") if p.strip()]
+    points = []
+    for p in paras[:bullets]:
+        points.append("- " + (p.replace("\n", " ")[:220]))
+    return "\n".join(points) if points else "⚠️ Недостаточно текста для резюме."
 
 def context_preview(conn, chat_id, user_id, project, question, limit=3):
     pinned = fetch_pinned_context(conn, chat_id, user_id, project, limit=limit)
     pinned_ids = [r[0] for r in pinned]
     sem = semantic_search_topk(conn, project, question or " ", k=limit) if question else []
     sem_ids = [r[0] for r in sem]
-    fb = fallback_ilike_search(conn, project, question or " ", exclude_ids=pinned_ids+sem_ids, limit=limit) if question else []
+    fb  = fallback_ilike_search(conn, project, question or " ", exclude_ids=pinned_ids+sem_ids, limit=limit) if question else []
     def fmt(rows, label):
         if not rows: return f"{label}: —"
         lines = []
@@ -290,7 +430,7 @@ def context_preview(conn, chat_id, user_id, project, question, limit=3):
 # --- Health -------------------------------------------------------------------
 @app.get("/health")
 def health():
-    info = {"ok": True, "service": "assistant-memory-bot", "db": False}
+    info = {"ok": True, "service": "assistant-memory-bot", "db": False, "llm_mode": "full" if llm_allowed() else "degraded"}
     try:
         conn = get_conn()
         with conn.cursor() as cur:
@@ -314,12 +454,12 @@ def webhook():
         user_id = user.get("id")
         text_raw = (msg.get("text") or "").strip()
 
-        if not chat_id or not text_raw:
+        if not chat_id or not (text_raw or msg.get("document") or msg.get("caption")):
             return {"ok": True}
 
-        parts = text_raw.split(maxsplit=1)
-        cmd = parts[0].lower() if parts else ""
-        arg = parts[1].strip() if len(parts) > 1 else ""
+        parts = (text_raw or "").split(maxsplit=1)
+        cmd = parts[0].lower() if (text_raw and parts) else ""
+        arg = parts[1].strip() if (text_raw and len(parts) > 1) else ""
 
         # /start
         if cmd == "/start":
@@ -328,29 +468,28 @@ def webhook():
                 "Команды:\n"
                 "/help — подсказка\n"
                 "/use <Project> — выбрать проект (например, /use Innertrade)\n"
-                "/projects — показать список известных проектов\n"
+                "/projects — список проектов\n"
                 "/find <запрос> — поиск по документам\n"
-                "/pin <id> [note] — закрепить версию\n"
-                "/pins — список закреплённого\n"
-                "/unpin <id> — снять закреп\n"
-                "/show <id> — показать начало контента\n"
-                "/context [вопрос] — показать, какие фрагменты пойдут в ответ\n"
-                "/reset [pins|project|all] — сброс закрепов/проекта\n"
-                "/summ <id> [n] — краткое резюме документа\n"
-                "/index <id> — проиндексировать документ для семантического поиска\n"
-                "/ask <вопрос> — ответ по памяти (пины → семантика → fallback)"
+                "/docs — список документов проекта\n"
+                "/new <type> | <title> — создать документ\n"
+                "/vers <doc_id> — версии документа\n"
+                "/add <doc_id> | <version> — ДОБАВИТЬ версию (реплай на текст или .md/.txt)\n"
+                "/delver <doc_version_id> — удалить версию\n"
+                "/export <doc_id> — показать последнюю версию целиком\n"
+                "/pin <id> [note], /pins, /unpin <id>, /show <id>\n"
+                "/context [вопрос], /reset [pins|project|all]\n"
+                "/summ <id> [n], /index <id>\n"
+                "/ask <вопрос> — RAG ответ (пины → семантика → fallback)"
             )
             return {"ok": True}
 
         # /help
         if cmd == "/help":
             send_message(chat_id,
-                "Подсказка:\n"
-                "/use <Project>, /projects\n"
-                "/find <запрос>, /pin <id> [note], /pins, /unpin <id>, /show <id>\n"
-                "/context [вопрос], /reset [pins|project|all]\n"
-                "/summ <id> [n], /index <id>\n"
-                "/ask <вопрос> — ответ по памяти (пины → семантика → fallback)"
+                "Контент:\n"
+                "/docs, /new <type> | <title>, /vers <doc_id>, /add <doc_id> | <version> (реплай на текст/.md/.txt), /delver <ver_id>, /export <doc_id>\n\n"
+                "Контекст и ответы:\n"
+                "/find, /pin, /pins, /unpin, /show, /context, /reset [pins|project|all], /summ, /index, /ask"
             )
             return {"ok": True}
 
@@ -382,7 +521,166 @@ def webhook():
             send_message(chat_id, f"Проект активирован: {project}")
             return {"ok": True}
 
-        # /find <query>
+        # /docs — список документов проекта
+        if cmd == "/docs":
+            conn = get_conn()
+            project = resolve_project(conn, chat_id, user_id)
+            if not project:
+                send_message(chat_id, "Сначала выбери проект: /use <Project>")
+                return {"ok": True}
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT id, type, title, to_char(created_at,'YYYY-MM-DD HH24:MI')
+                    FROM docs
+                    WHERE project=%s
+                    ORDER BY created_at DESC
+                    LIMIT 20;
+                """, (project,))
+                rows = cur.fetchall()
+            if not rows:
+                send_message(chat_id, "Документов пока нет. Создай: /new <type> | <title>")
+                return {"ok": True}
+            lines = [f"{i}) [id:{doc_id}] {typ} — {title} ({created})"
+                     for i,(doc_id,typ,title,created) in enumerate(rows,1)]
+            send_message(chat_id, "Документы:\n" + "\n".join(lines))
+            return {"ok": True}
+
+        # /new <type> | <title>
+        if cmd == "/new":
+            if "|" not in arg:
+                send_message(chat_id, "Формат: /new <type> | <title>")
+                return {"ok": True}
+            typ, title = [x.strip() for x in arg.split("|",1)]
+            if not typ or not title:
+                send_message(chat_id, "Укажи тип и заголовок: /new <type> | <title>")
+                return {"ok": True}
+            conn = get_conn()
+            project = resolve_project(conn, chat_id, user_id)
+            if not project:
+                send_message(chat_id, "Сначала выбери проект: /use <Project>")
+                return {"ok": True}
+            with conn.cursor() as cur:
+                # если уже есть такой документ — вернём id
+                cur.execute("""
+                    SELECT id FROM docs WHERE project=%s AND type=%s AND title=%s LIMIT 1;
+                """, (project, typ, title))
+                row = cur.fetchone()
+                if row:
+                    send_message(chat_id, f"Документ уже существует: [id:{row[0]}] {typ} — {title}")
+                    return {"ok": True}
+                cur.execute("""
+                    INSERT INTO docs (project, type, title) VALUES (%s,%s,%s) RETURNING id;
+                """, (project, typ, title))
+                doc_id = cur.fetchone()[0]
+            send_message(chat_id, f"Создан документ [id:{doc_id}] {typ} — {title}\nТеперь добавь версию: /add {doc_id} | v0.1.0 (реплай на текст или .md/.txt)")
+            return {"ok": True}
+
+        # /vers <doc_id>
+        if cmd == "/vers":
+            try:
+                doc_id = int(arg)
+            except Exception:
+                send_message(chat_id, "Формат: /vers <doc_id>")
+                return {"ok": True}
+            conn = get_conn()
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT dv.id, dv.version, LEFT(dv.content_md, 160), to_char(dv.created_at,'YYYY-MM-DD HH24:MI')
+                    FROM doc_versions dv
+                    WHERE dv.doc_id=%s
+                    ORDER BY dv.created_at DESC
+                    LIMIT 20;
+                """, (doc_id,))
+                rows = cur.fetchall()
+            if not rows:
+                send_message(chat_id, "Версий пока нет. Добавь: /add <doc_id> | <version> (реплай на текст/.md/.txt)")
+                return {"ok": True}
+            lines = [f"{i}) [ver:{vid}] {ver} — {created}\n↳ {prev.replace(chr(10),' ')}"
+                     for i,(vid,ver,prev,created) in enumerate(rows,1)]
+            send_message(chat_id, "Версии:\n" + "\n\n".join(lines))
+            return {"ok": True}
+
+        # /add <doc_id> | <version>  (контент берём из сообщения, на которое ты отвечаешь)
+        if cmd == "/add":
+            if "|" not in arg:
+                send_message(chat_id, "Формат: /add <doc_id> | <version>\nВажно: команда должна быть ответом (reply) на сообщение с текстом или .md/.txt файлом.")
+                return {"ok": True}
+            left, version = [x.strip() for x in arg.split("|",1)]
+            try:
+                doc_id = int(left)
+            except Exception:
+                send_message(chat_id, "doc_id должен быть числом. Пример: /add 12 | v0.1.0")
+                return {"ok": True}
+            content, err = get_text_from_reply(msg)
+            if err:
+                send_message(chat_id, err)
+                return {"ok": True}
+            conn = get_conn()
+            with conn.cursor() as cur:
+                # Проверим, что документ существует
+                cur.execute("SELECT title FROM docs WHERE id=%s LIMIT 1;", (doc_id,))
+                row = cur.fetchone()
+                if not row:
+                    send_message(chat_id, "Документ не найден. Сначала создай: /new <type> | <title>")
+                    return {"ok": True}
+                title = row[0]
+                # пишем версию
+                cur.execute("""
+                    INSERT INTO doc_versions (doc_id, version, content_md)
+                    VALUES (%s,%s,%s)
+                    RETURNING id;
+                """, (doc_id, version, content))
+                ver_id = cur.fetchone()[0]
+                # чистим старые чанки на всякий случай
+                cur.execute("DELETE FROM doc_chunks WHERE doc_version_id=%s;", (ver_id,))
+            send_message(chat_id, f"Добавлена версия [id:{ver_id}] для документа {title} ({version}).\nИндексацию семантики можно сделать позже: /index {ver_id}")
+            return {"ok": True}
+
+        # /delver <doc_version_id>
+        if cmd == "/delver":
+            try:
+                ver_id = int(arg)
+            except Exception:
+                send_message(chat_id, "Формат: /delver <doc_version_id>")
+                return {"ok": True}
+            conn = get_conn()
+            with conn.cursor() as cur:
+                # снимем пины с этой версии
+                cur.execute("DELETE FROM pins WHERE doc_version_id=%s;", (ver_id,))
+                # удалим чанки (каскад есть, но на всякий)
+                cur.execute("DELETE FROM doc_chunks WHERE doc_version_id=%s;", (ver_id,))
+                # удалим версию
+                cur.execute("DELETE FROM doc_versions WHERE id=%s;", (ver_id,))
+                deleted = cur.rowcount
+            send_message(chat_id, "Версия удалена." if deleted else "Такой версии не найдено.")
+            return {"ok": True}
+
+        # /export <doc_id> — показать последнюю версию целиком
+        if cmd == "/export":
+            try:
+                doc_id = int(arg)
+            except Exception:
+                send_message(chat_id, "Формат: /export <doc_id>")
+                return {"ok": True}
+            conn = get_conn()
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT d.title, dv.version, dv.content_md
+                    FROM doc_versions dv
+                    JOIN docs d ON d.id = dv.doc_id
+                    WHERE dv.doc_id=%s
+                    ORDER BY dv.created_at DESC
+                    LIMIT 1;
+                """, (doc_id,))
+                row = cur.fetchone()
+            if not row:
+                send_message(chat_id, "У документа нет версий.")
+                return {"ok": True}
+            title, version, content = row
+            send_long_message(chat_id, f"{title} • {version}\n\n{content or ''}")
+            return {"ok": True}
+
+        # /find (как было)
         if cmd == "/find":
             if not arg:
                 send_message(chat_id, "Формат: /find ключевые слова")
@@ -391,20 +689,43 @@ def webhook():
             conn = get_conn()
             project = resolve_project(conn, chat_id, user_id)
             if not project:
-                send_message(chat_id, "Сначала выбери проект: /use <Project> (или задай DEFAULT_PROJECT в ENV).")
+                send_message(chat_id, "Сначала выбери проект: /use <Project>.")
                 return {"ok": True}
             with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT title, type, version, doc_version_id,
-                           LEFT(content_md, 160) AS preview
-                    FROM vw_latest_versions
-                    WHERE project = %s
-                      AND (title ILIKE '%%'||%s||'%%'
-                       OR  content_md ILIKE '%%'||%s||'%%')
-                    ORDER BY created_at DESC
-                    LIMIT 5;
-                """, (project, query, query))
-                rows = cur.fetchall()
+                try:
+                    cur.execute("""
+                        SELECT title, type, version, doc_version_id,
+                               LEFT(content_md, 160) AS preview
+                        FROM vw_latest_versions
+                        WHERE project = %s
+                          AND (title ILIKE '%%'||%s||'%%'
+                           OR  content_md ILIKE '%%'||%s||'%%')
+                        ORDER BY created_at DESC
+                        LIMIT 5;
+                    """, (project, query, query))
+                    rows = cur.fetchall()
+                except Exception:
+                    # без вьюхи
+                    cur.execute("""
+                        WITH latest AS (
+                          SELECT dv.*
+                          FROM doc_versions dv
+                          JOIN (
+                            SELECT doc_id, MAX(created_at) AS mx
+                            FROM doc_versions GROUP BY doc_id
+                          ) x ON x.doc_id = dv.doc_id AND x.mx = dv.created_at
+                          JOIN docs d ON d.id = dv.doc_id
+                          WHERE d.project = %s
+                        )
+                        SELECT d.title, d.type, l.version, l.id AS doc_version_id,
+                               LEFT(l.content_md, 160) AS preview
+                        FROM latest l
+                        JOIN docs d ON d.id = l.doc_id
+                        WHERE (d.title ILIKE '%%'||%s||'%%' OR l.content_md ILIKE '%%'||%s||'%%')
+                        ORDER BY l.created_at DESC
+                        LIMIT 5;
+                    """, (project, query, query))
+                    rows = cur.fetchall()
             if not rows:
                 send_message(chat_id, "Ничего не нашёл. Попробуй другие слова.")
                 return {"ok": True}
@@ -418,7 +739,7 @@ def webhook():
             send_message(chat_id, reply)
             return {"ok": True}
 
-        # /pin <id> [note]
+        # пины и просмотр
         if cmd == "/pin":
             if not arg:
                 send_message(chat_id, "Формат: /pin <doc_version_id> [note]")
@@ -433,7 +754,7 @@ def webhook():
             conn = get_conn()
             project = resolve_project(conn, chat_id, user_id)
             if not project:
-                send_message(chat_id, "Сначала выбери проект: /use <Project> (или задай DEFAULT_PROJECT в ENV).")
+                send_message(chat_id, "Сначала выбери проект: /use <Project>.")
                 return {"ok": True}
             with conn.cursor() as cur:
                 cur.execute("""
@@ -456,12 +777,11 @@ def webhook():
             send_message(chat_id, f"Закрепил: {title} • {version} (id:{ver_id})")
             return {"ok": True}
 
-        # /pins
         if cmd == "/pins":
             conn = get_conn()
             project = resolve_project(conn, chat_id, user_id)
             if not project:
-                send_message(chat_id, "Сначала выбери проект: /use <Project> (или задай DEFAULT_PROJECT в ENV).")
+                send_message(chat_id, "Сначала выбери проект: /use <Project>.")
                 return {"ok": True}
             with conn.cursor() as cur:
                 cur.execute("""
@@ -478,13 +798,12 @@ def webhook():
                 send_message(chat_id, "Пока ничего не закреплено. Используй /pin <id> из /find.")
                 return {"ok": True}
             lines = []
-            for i, (pid, ver_id, title, version, note) in enumerate(rows, 1):
+            for i, (_pid, ver_id, title, version, note) in enumerate(rows, 1):
                 extra = f" — {note}" if note else ""
                 lines.append(f"{i}) {title} • {version} (id:{ver_id}){extra}")
             send_message(chat_id, "Закреплено:\n" + "\n".join(lines))
             return {"ok": True}
 
-        # /unpin <id>
         if cmd == "/unpin":
             if not arg:
                 send_message(chat_id, "Формат: /unpin <doc_version_id>")
@@ -497,15 +816,13 @@ def webhook():
             conn = get_conn()
             project = resolve_project(conn, chat_id, user_id)
             if not project:
-                send_message(chat_id, "Сначала выбери проект: /use <Project> (или задай DEFAULT_PROJECT в ENV).")
+                send_message(chat_id, "Сначала выбери проект: /use <Project>.")
                 return {"ok": True}
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM pins WHERE chat_id=%s AND user_id=%s AND project=%s AND doc_version_id=%s;", (chat_id, user_id, project, ver_id))
-                deleted = cur.rowcount
-            send_message(chat_id, "Снял закреп." if deleted else "Такой закреп не найден.")
+            send_message(chat_id, "Снял закреп.")
             return {"ok": True}
 
-        # /show <id>
         if cmd == "/show":
             if not arg:
                 send_message(chat_id, "Формат: /show <doc_version_id>")
@@ -518,19 +835,19 @@ def webhook():
             conn = get_conn()
             project = resolve_project(conn, chat_id, user_id)
             if not project:
-                send_message(chat_id, "Сначала выбери проект: /use <Project> (или задай DEFAULT_PROJECT в ENV).")
+                send_message(chat_id, "Сначала выбери проект: /use <Project>.")
                 return {"ok": True}
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT d.title, dv.version, dv.content_md
                     FROM doc_versions dv
                     JOIN docs d ON d.id = dv.doc_id
-                    WHERE dv.id=%s AND d.project=%s
+                    WHERE dv.id=%s
                     LIMIT 1;
-                """, (ver_id, project))
+                """, (ver_id,))
                 row = cur.fetchone()
             if not row:
-                send_message(chat_id, "Версия не найдена в активном проекте.")
+                send_message(chat_id, "Версия не найдена.")
                 return {"ok": True}
             title, version, content = row
             snippet = (content or "")[:800]
@@ -542,7 +859,7 @@ def webhook():
             conn = get_conn()
             project = resolve_project(conn, chat_id, user_id)
             if not project:
-                send_message(chat_id, "Сначала выбери проект: /use <Project> (или задай DEFAULT_PROJECT в ENV).")
+                send_message(chat_id, "Сначала выбери проект: /use <Project>.")
                 return {"ok": True}
             question = arg or " "
             preview = context_preview(conn, chat_id, user_id, project, question, limit=3)
@@ -573,7 +890,7 @@ def webhook():
                     cur.execute("DELETE FROM chat_context WHERE chat_id=%s AND user_id=%s;", (chat_id, user_id))
                 send_message(chat_id, "Активный проект сброшен. Укажи заново: /use <Project>")
                 return {"ok": True}
-            send_message(chat_id, "Формат: /reset [pins|project|all]\n• /reset pins — снять все закрепы в текущем проекте\n• /reset project — сбросить активный проект\n• /reset all — очистить все пины и сбросить проект(ы)")
+            send_message(chat_id, "Формат: /reset [pins|project|all]")
             return {"ok": True}
 
         # /summ <doc_version_id> [n]
@@ -594,21 +911,17 @@ def webhook():
                 except ValueError:
                     bullets = 5
             conn = get_conn()
-            project = resolve_project(conn, chat_id, user_id)
-            if not project:
-                send_message(chat_id, "Сначала выбери проект: /use <Project> (или задай DEFAULT_PROJECT в ENV).")
-                return {"ok": True}
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT d.title, dv.version, dv.content_md
                     FROM doc_versions dv
                     JOIN docs d ON d.id = dv.doc_id
-                    WHERE dv.id=%s AND d.project=%s
+                    WHERE dv.id=%s
                     LIMIT 1;
-                """, (ver_id, project))
+                """, (ver_id,))
                 row = cur.fetchone()
             if not row:
-                send_message(chat_id, "Версия не найдена в активном проекте.")
+                send_message(chat_id, "Версия не найдена.")
                 return {"ok": True}
             title, version, content = row
             summary = summarize_doc(title, version, content or "", bullets)
@@ -616,7 +929,7 @@ def webhook():
             send_message(chat_id, summary)
             return {"ok": True}
 
-        # /index <doc_version_id> — построить эмбеддинги для документа
+        # /index <doc_version_id> — индексация (семантика, при наличии ключа)
         if cmd == "/index":
             if not arg:
                 send_message(chat_id, "Формат: /index <doc_version_id>\nИндексация создаёт чанки и эмбеддинги для семантического поиска.")
@@ -627,49 +940,47 @@ def webhook():
                 send_message(chat_id, "id должен быть числом (см. /find).")
                 return {"ok": True}
             conn = get_conn()
-            project = resolve_project(conn, chat_id, user_id)
-            if not project:
-                send_message(chat_id, "Сначала выбери проект: /use <Project> (или задай DEFAULT_PROJECT в ENV).")
-                return {"ok": True}
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT d.title, dv.version, dv.content_md
                     FROM doc_versions dv
                     JOIN docs d ON d.id = dv.doc_id
-                    WHERE dv.id=%s AND d.project=%s
+                    WHERE dv.id=%s
                     LIMIT 1;
-                """, (ver_id, project))
+                """, (ver_id,))
                 row = cur.fetchone()
             if not row:
-                send_message(chat_id, "Версия не найдена в активном проекте.")
+                send_message(chat_id, "Версия не найдена.")
                 return {"ok": True}
             title, version, content = row
             chunks = chunk_text(content or "", max_len=900, overlap=120)
             if not chunks:
                 send_message(chat_id, "Пустой документ: нечего индексировать.")
                 return {"ok": True}
-            # удалим старый индекс этой версии
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM doc_chunks WHERE doc_version_id=%s;", (ver_id,))
-            # эмбеддинги пачками по 64
-            batch = 64
-            total = len(chunks)
             inserted = 0
-            for start in range(0, total, batch):
-                part = chunks[start:start+batch]
-                embs = embed_texts(part)
+            try:
+                batch = 64
+                for s in range(0, len(chunks), batch):
+                    part = chunks[s:s+batch]
+                    embs = embed_texts(part)  # может кинуть при пустом ключе/квоте
+                    with conn.cursor() as cur:
+                        for i, (chunk, emb) in enumerate(zip(part, embs), start=s):
+                            vec = "[" + ",".join(f"{x:.6f}" for x in emb) + "]"
+                            cur.execute("INSERT INTO doc_chunks (doc_version_id, chunk_no, content, embedding) VALUES (%s,%s,%s,%s::vector);", (ver_id, i, chunk, vec))
+                            inserted += 1
+                send_message(chat_id, f"Проиндексировано: {inserted} чанков (семантика активна) для {title} • {version} (id:{ver_id}).")
+            except Exception as e:
+                # fallback — сохраняем без эмбеддингов, чтобы потом можно было переиндексировать
                 with conn.cursor() as cur:
-                    for i, (chunk, emb) in enumerate(zip(part, embs), start=start):
-                        vec_str = vector_to_sql_literal(emb)
-                        cur.execute(
-                            "INSERT INTO doc_chunks (doc_version_id, chunk_no, content, embedding) VALUES (%s,%s,%s,%s::vector);",
-                            (ver_id, i, chunk, vec_str)
-                        )
+                    for i, chunk in enumerate(chunks):
+                        cur.execute("INSERT INTO doc_chunks (doc_version_id, chunk_no, content, embedding) VALUES (%s,%s,%s,NULL);", (ver_id, i, chunk))
                         inserted += 1
-            send_message(chat_id, f"Проиндексировано: {inserted} чанков для {title} • {version} (id:{ver_id}).")
+                send_message(chat_id, f"Сохранил {inserted} чанков без эмбеддингов (нет доступа к API). Позже повтори /index {ver_id}.")
             return {"ok": True}
 
-        # /ask <question> — RAG ответ (пины → семантика → fallback) + источники
+        # /ask — RAG (пины → семантика → fallback) + источники, с мягким фолбэком без LLM
         if cmd == "/ask":
             if not arg or len(arg.strip()) < 2:
                 send_message(chat_id, "Сформулируй вопрос чуть конкретнее 🙏")
@@ -678,23 +989,23 @@ def webhook():
             conn = get_conn()
             project = resolve_project(conn, chat_id, user_id)
             if not project:
-                send_message(chat_id, "Сначала выбери проект: /use <Project> (или задай DEFAULT_PROJECT в ENV).")
+                send_message(chat_id, "Сначала выбери проект: /use <Project>.")
                 return {"ok": True}
             pinned = fetch_pinned_context(conn, chat_id, user_id, project, limit=4)
             pinned_ids = [r[0] for r in pinned]
             sem = semantic_search_topk(conn, project, question, k=6)
             sem_ids = [r[0] for r in sem]
-            fb = fallback_ilike_search(conn, project, question, exclude_ids=pinned_ids+sem_ids, limit=4)
+            fb  = fallback_ilike_search(conn, project, question, exclude_ids=pinned_ids+sem_ids, limit=4)
             rows = pinned + sem + fb
             blocks = build_context_blocks(rows)
-            answer = rag_answer(question, blocks)
+            answer = llm_answer_or_fallback(question, blocks)
             if rows:
                 src_lines = [f"- [id:{vid}] {t} • {ver}" for (vid, t, ver, _c) in rows[:8]]
                 answer += "\n\nИсточники:\n" + "\n".join(src_lines)
             send_message(chat_id, answer)
             return {"ok": True}
 
-        # Любой некомандный текст — трактуем как вопрос (тот же RAG) + источники
+        # Свободный текст → как /ask
         if not text_raw.startswith("/"):
             question = text_raw.strip()
             if len(question) < 2:
@@ -703,23 +1014,23 @@ def webhook():
             conn = get_conn()
             project = resolve_project(conn, chat_id, user_id)
             if not project:
-                send_message(chat_id, "Сначала выбери проект: /use <Project> (или задай DEFAULT_PROJECT в ENV).")
+                send_message(chat_id, "Сначала выбери проект: /use <Project>.")
                 return {"ok": True}
             pinned = fetch_pinned_context(conn, chat_id, user_id, project, limit=4)
             pinned_ids = [r[0] for r in pinned]
             sem = semantic_search_topk(conn, project, question, k=6)
             sem_ids = [r[0] for r in sem]
-            fb = fallback_ilike_search(conn, project, question, exclude_ids=pinned_ids+sem_ids, limit=4)
+            fb  = fallback_ilike_search(conn, project, question, exclude_ids=pinned_ids+sem_ids, limit=4)
             rows = pinned + sem + fb
             blocks = build_context_blocks(rows)
-            answer = rag_answer(question, blocks)
+            answer = llm_answer_or_fallback(question, blocks)
             if rows:
                 src_lines = [f"- [id:{vid}] {t} • {ver}" for (vid, t, ver, _c) in rows[:8]]
                 answer += "\n\nИсточники:\n" + "\n".join(src_lines)
             send_message(chat_id, answer)
             return {"ok": True}
 
-        # Нераспознанная команда
+        # нераспознанная команда
         send_message(chat_id, "Команда не распознана. /help")
         return {"ok": True}
 
