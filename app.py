@@ -3,7 +3,7 @@ import time
 import json
 import urllib.request
 import urllib.parse
-from flask import Flask, request
+from flask import Flask, request, jsonify
 import psycopg
 from psycopg import OperationalError
 from openai import OpenAI
@@ -88,7 +88,7 @@ def init_db(conn):
             );
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS ix_doc_versions_doc ON doc_versions (doc_id);")
-        # pgvector индекс для семантики (не обязателен для текущей задачи)
+        # pgvector
         cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS doc_chunks (
@@ -106,8 +106,7 @@ def init_db(conn):
             cur.execute("CREATE INDEX IF NOT EXISTS ix_doc_chunks_embedding_hnsw ON doc_chunks USING hnsw (embedding vector_l2_ops);")
         except Exception:
             pass
-        # materialized view-стайл: создадим представление latest-версий, если его нет
-        # Примечание: CREATE VIEW IF NOT EXISTS доступен в PG15+, в Neon обычно ок.
+        # представление latest-версий (если доступно)
         try:
             cur.execute("""
                 CREATE VIEW IF NOT EXISTS vw_latest_versions AS
@@ -124,7 +123,6 @@ def init_db(conn):
                 ORDER BY d.id, dv.created_at DESC;
             """)
         except Exception:
-            # если уже существует с другим определением — пропустим, код ниже умеет без вьюхи
             pass
 
 def get_conn():
@@ -227,7 +225,7 @@ def get_text_from_reply(msg: dict):
             return None, f"Не удалось скачать файл: {e}"
     return None, "В ответе нет текста или поддерживаемого файла."
 
-# --- Text chunking & embeddings (необязательное, работает только при наличии ключа) ---
+# --- Text chunking & embeddings ----------------------------------------------
 def chunk_text(text: str, max_len: int = 900, overlap: int = 120):
     text = (text or "").strip()
     if not text:
@@ -318,17 +316,18 @@ def fallback_ilike_search(conn, project, query, exclude_ids=None, limit=4):
         params.extend(exclude_ids)
     sql += """
           AND (title ILIKE '%%' || %s || '%%'
-           OR  content_md ILIKE '%%' || %s || '%%')
+           OR  content_md ILIKE '%%' || '%%' || %s || '%%')
         ORDER BY created_at DESC
         LIMIT %s;
     """
+    # поправка: повторить query для content_md
     params.extend([query, query, limit])
     with conn.cursor() as cur:
         try:
             cur.execute(sql, params)
             return cur.fetchall()
         except Exception:
-            # если вьюхи нет — берём последний dv для каждого doc вручную
+            # без вьюхи
             cur.execute("""
                 WITH latest AS (
                   SELECT dv.*
@@ -427,7 +426,11 @@ def context_preview(conn, chat_id, user_id, project, question, limit=3):
         return f"{label}:\n" + "\n".join(lines)
     return fmt(pinned, "Пины") + "\n\n" + fmt(sem, "Семантика") + "\n\n" + fmt(fb, "Fallback")
 
-# --- Health -------------------------------------------------------------------
+# --- Health & Root ------------------------------------------------------------
+@app.get("/")
+def root():
+    return jsonify({"ok": True, "service": "assistant-memory-bot", "msg": "see /health and Telegram webhook"}), 200
+
 @app.get("/health")
 def health():
     info = {"ok": True, "service": "assistant-memory-bot", "db": False, "llm_mode": "full" if llm_allowed() else "degraded"}
@@ -439,7 +442,7 @@ def health():
         info["db"] = True
     except Exception as e:
         info["error"] = str(e)[:200]
-    return info
+    return jsonify(info), 200
 
 # --- Webhook ------------------------------------------------------------------
 @app.post(WEBHOOK_PATH)
@@ -491,6 +494,36 @@ def webhook():
                 "Контекст и ответы:\n"
                 "/find, /pin, /pins, /unpin, /show, /context, /reset [pins|project|all], /summ, /index, /ask"
             )
+            return {"ok": True}
+
+        # /diag (новая команда)
+        if cmd == "/diag":
+            llm_mode = "full" if llm_allowed() else "degraded"
+            ping_ms = -1
+            if client is not None:
+                try:
+                    t0 = time.time()
+                    client.embeddings.create(model=EMB_MODEL, input="ok")
+                    ping_ms = int((time.time() - t0) * 1000)
+                except Exception as e:
+                    llm_mode = "degraded"
+            # DB агрегаты
+            docs = vers = chunks = pins_cnt = 0
+            try:
+                conn = get_conn()
+                with conn.cursor() as cur:
+                    cur.execute("SELECT count(*) FROM docs;");      docs = cur.fetchone()[0]
+                    cur.execute("SELECT count(*) FROM doc_versions;"); vers = cur.fetchone()[0]
+                    cur.execute("SELECT count(*) FROM doc_chunks;");   chunks = cur.fetchone()[0]
+                    cur.execute("SELECT count(*) FROM pins;");         pins_cnt = cur.fetchone()[0]
+                db_ok = True
+            except Exception:
+                db_ok = False
+            txt = (f"Status: {'OK' if (llm_mode=='full' and db_ok) else 'DEGRADED'}\n"
+                   f"LLM: mode={llm_mode} model={LLM_MODEL} ping={ping_ms}ms\n"
+                   f"DB: ok={db_ok} (docs={docs}, vers={vers}, chunks={chunks}, pins={pins_cnt})\n"
+                   f"Env: project={DEFAULT_PROJECT or '(не задан)'}")
+            send_message(chat_id, txt)
             return {"ok": True}
 
         # /projects
@@ -560,7 +593,6 @@ def webhook():
                 send_message(chat_id, "Сначала выбери проект: /use <Project>")
                 return {"ok": True}
             with conn.cursor() as cur:
-                # если уже есть такой документ — вернём id
                 cur.execute("""
                     SELECT id FROM docs WHERE project=%s AND type=%s AND title=%s LIMIT 1;
                 """, (project, typ, title))
@@ -600,7 +632,7 @@ def webhook():
             send_message(chat_id, "Версии:\n" + "\n\n".join(lines))
             return {"ok": True}
 
-        # /add <doc_id> | <version>  (контент берём из сообщения, на которое ты отвечаешь)
+        # /add <doc_id> | <version>  (контент берём из reply)
         if cmd == "/add":
             if "|" not in arg:
                 send_message(chat_id, "Формат: /add <doc_id> | <version>\nВажно: команда должна быть ответом (reply) на сообщение с текстом или .md/.txt файлом.")
@@ -617,21 +649,18 @@ def webhook():
                 return {"ok": True}
             conn = get_conn()
             with conn.cursor() as cur:
-                # Проверим, что документ существует
                 cur.execute("SELECT title FROM docs WHERE id=%s LIMIT 1;", (doc_id,))
                 row = cur.fetchone()
                 if not row:
                     send_message(chat_id, "Документ не найден. Сначала создай: /new <type> | <title>")
                     return {"ok": True}
                 title = row[0]
-                # пишем версию
                 cur.execute("""
                     INSERT INTO doc_versions (doc_id, version, content_md)
                     VALUES (%s,%s,%s)
                     RETURNING id;
                 """, (doc_id, version, content))
                 ver_id = cur.fetchone()[0]
-                # чистим старые чанки на всякий случай
                 cur.execute("DELETE FROM doc_chunks WHERE doc_version_id=%s;", (ver_id,))
             send_message(chat_id, f"Добавлена версия [id:{ver_id}] для документа {title} ({version}).\nИндексацию семантики можно сделать позже: /index {ver_id}")
             return {"ok": True}
@@ -645,17 +674,14 @@ def webhook():
                 return {"ok": True}
             conn = get_conn()
             with conn.cursor() as cur:
-                # снимем пины с этой версии
                 cur.execute("DELETE FROM pins WHERE doc_version_id=%s;", (ver_id,))
-                # удалим чанки (каскад есть, но на всякий)
                 cur.execute("DELETE FROM doc_chunks WHERE doc_version_id=%s;", (ver_id,))
-                # удалим версию
                 cur.execute("DELETE FROM doc_versions WHERE id=%s;", (ver_id,))
                 deleted = cur.rowcount
             send_message(chat_id, "Версия удалена." if deleted else "Такой версии не найдено.")
             return {"ok": True}
 
-        # /export <doc_id> — показать последнюю версию целиком
+        # /export <doc_id>
         if cmd == "/export":
             try:
                 doc_id = int(arg)
@@ -680,7 +706,7 @@ def webhook():
             send_long_message(chat_id, f"{title} • {version}\n\n{content or ''}")
             return {"ok": True}
 
-        # /find (как было)
+        # /find
         if cmd == "/find":
             if not arg:
                 send_message(chat_id, "Формат: /find ключевые слова")
@@ -705,7 +731,6 @@ def webhook():
                     """, (project, query, query))
                     rows = cur.fetchall()
                 except Exception:
-                    # без вьюхи
                     cur.execute("""
                         WITH latest AS (
                           SELECT dv.*
@@ -721,7 +746,7 @@ def webhook():
                                LEFT(l.content_md, 160) AS preview
                         FROM latest l
                         JOIN docs d ON d.id = l.doc_id
-                        WHERE (d.title ILIKE '%%'||%s||'%%' OR l.content_md ILIKE '%%'||%s||'%%')
+                        WHERE (d.title ILIKE '%%' || %s || '%%' OR l.content_md ILIKE '%%' || %s || '%%')
                         ORDER BY l.created_at DESC
                         LIMIT 5;
                     """, (project, query, query))
@@ -739,7 +764,7 @@ def webhook():
             send_message(chat_id, reply)
             return {"ok": True}
 
-        # пины и просмотр
+        # пины
         if cmd == "/pin":
             if not arg:
                 send_message(chat_id, "Формат: /pin <doc_version_id> [note]")
@@ -929,7 +954,7 @@ def webhook():
             send_message(chat_id, summary)
             return {"ok": True}
 
-        # /index <doc_version_id> — индексация (семантика, при наличии ключа)
+        # /index <doc_version_id>
         if cmd == "/index":
             if not arg:
                 send_message(chat_id, "Формат: /index <doc_version_id>\nИндексация создаёт чанки и эмбеддинги для семантического поиска.")
@@ -972,7 +997,6 @@ def webhook():
                             inserted += 1
                 send_message(chat_id, f"Проиндексировано: {inserted} чанков (семантика активна) для {title} • {version} (id:{ver_id}).")
             except Exception as e:
-                # fallback — сохраняем без эмбеддингов, чтобы потом можно было переиндексировать
                 with conn.cursor() as cur:
                     for i, chunk in enumerate(chunks):
                         cur.execute("INSERT INTO doc_chunks (doc_version_id, chunk_no, content, embedding) VALUES (%s,%s,%s,NULL);", (ver_id, i, chunk))
@@ -980,7 +1004,7 @@ def webhook():
                 send_message(chat_id, f"Сохранил {inserted} чанков без эмбеддингов (нет доступа к API). Позже повтори /index {ver_id}.")
             return {"ok": True}
 
-        # /ask — RAG (пины → семантика → fallback) + источники, с мягким фолбэком без LLM
+        # /ask — RAG
         if cmd == "/ask":
             if not arg or len(arg.strip()) < 2:
                 send_message(chat_id, "Сформулируй вопрос чуть конкретнее 🙏")
@@ -1044,4 +1068,6 @@ def webhook():
 
 # --- Entrypoint ---------------------------------------------------------------
 if __name__ == "__main__":
+    # Локально можно гонять так; на Render лучше запускать через gunicorn:
+    # gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 8 --timeout 120
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
