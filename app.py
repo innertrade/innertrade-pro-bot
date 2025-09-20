@@ -316,7 +316,7 @@ def fallback_ilike_search(conn, project, query, exclude_ids=None, limit=4):
         params.extend(exclude_ids)
     sql += """
           AND (title ILIKE '%%' || %s || '%%'
-           OR  content_md ILIKE '%%' || '%%' || %s || '%%')
+           OR  content_md ILIKE '%%' || %s || '%%')
         ORDER BY created_at DESC
         LIMIT %s;
     """
@@ -1071,3 +1071,4 @@ if __name__ == "__main__":
     # Локально можно гонять так; на Render лучше запускать через gunicorn:
     # gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 8 --timeout 120
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+
